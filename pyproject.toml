@@ -9,7 +9,7 @@ description = "Private Telegram DNS administration bot for ArvanCloud"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
-    "arvancld @ https://github.com/faridrasidov/arvancld/archive/c71a3fee9597adc98ce1b9c2044254932b7b1e68.zip",
+    "arvancld @ https://github.com/faridrasidov/arvancld/archive/27985b88be2a9b5f72248f4c76feb37fa1ed28d5.zip",
     "pyTelegramBotAPI==4.34.0",
     "python-dotenv>=1.0,<2",
 ]

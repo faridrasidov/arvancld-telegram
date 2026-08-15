@@ -13,6 +13,10 @@ five-minute confirmation screen.
 - One ArvanCloud account is configured on the server; credentials are never entered in Telegram.
 - Only numeric Telegram user IDs in `TELEGRAM_ADMIN_IDS` are accepted.
 - Only private chats are accepted. Group and channel updates are rejected.
+- When ArvanCloud requires TOTP, the first allowlisted administrator to open `/auth` owns the
+  prompt for five minutes. The six-digit message is deleted immediately on a best-effort basis,
+  submitted once, and never stored or logged. Telegram delivery and deletion are not a substitute
+  for protecting the administrator's Telegram account and device.
 - The saved ArvanCloud session contains bearer and refresh tokens in plaintext. Keep the `data/`
   directory private, backed up only through an encrypted mechanism, and never commit it.
 - Logs contain actor IDs, actions, domains, record IDs, statuses, and request IDs. They do not
@@ -62,7 +66,8 @@ usernames; forwarding one of your messages to an ID-inspection bot is a common w
 Treat third-party ID bots as untrusted and do not send them secrets.
 
 The SDK dependency is pinned to the verified Git commit
-`c71a3fee9597adc98ce1b9c2044254932b7b1e68` for reproducible installs.
+`27985b88be2a9b5f72248f4c76feb37fa1ed28d5` for reproducible installs and typed TOTP challenge
+support.
 
 ## Run locally
 
@@ -72,6 +77,10 @@ python -m venv .venv
 .\.venv\Scripts\python.exe -m arvancld_telegram
 ```
 
+When upgrading an existing virtual environment from the pre-TOTP SDK commit, recreate the
+environment or force-reinstall the pinned `arvancld` archive. Both commits currently identify as
+version `0.1.0`, so pip may otherwise retain the already-installed build.
+
 The installed console command is equivalent:
 
 ```powershell
@@ -79,9 +88,15 @@ The installed console command is equivalent:
 ```
 
 On startup the bot loads its saved session. Missing, invalid, or expired sessions trigger one
-account login and an atomic session save. A later `401` or `403` triggers one token refresh; a
-rejected refresh triggers one password login. Login, refresh, and DNS mutations are otherwise not
-retried.
+account login and an atomic session save. If that login requires TOTP, the bot starts polling in a
+restricted `OTP required` state and best-effort notifies the configured administrator chat IDs.
+Telegram may reject a notification until that user has opened the bot at least once; `/auth` is
+always the fallback.
+
+A later `401` or `403` triggers one token refresh; a rejected refresh triggers one password login.
+If this fallback reaches TOTP, the active DNS operation stops and is never resumed automatically.
+After authentication, repeat the read operation or rebuild and reconfirm the mutation. Login,
+refresh, OTP submission, and DNS mutations are otherwise not retried.
 
 ## Run with Docker Compose
 
@@ -100,6 +115,7 @@ No container port is published because Telegram updates are received with long p
 ## Bot commands
 
 - `/start` or `/domains` — list domains and open DNS administration.
+- `/auth` — claim, complete, or restart interactive ArvanCloud login.
 - `/status` — validate ArvanCloud access and show the domain count.
 - `/help` — show commands and record types.
 - `/cancel` — cancel the current input or confirmation.
@@ -108,6 +124,11 @@ Domain and record pages contain eight items and provide previous/next navigation
 exact-name search, record-type filtering, and back actions. Protected provider records are visible
 but read-only. Before updating, toggling, or deleting, the bot reloads the record and refuses the
 change if its `updated_at` value no longer matches the selected snapshot.
+
+When authentication is incomplete, `/status` reports `OTP required`, `authenticating`, or
+`unavailable` without attempting a CDN request. `/cancel` releases an owned OTP prompt; the next
+`/auth` starts a fresh password-login challenge. An OTP request with a network-uncertain result is
+not retried and must also be restarted with `/auth`.
 
 ## Validation
 

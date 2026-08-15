@@ -2,15 +2,22 @@
 
 from __future__ import annotations
 
+import asyncio
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
-from arvancld import AuthenticationError, NetworkError
+from arvancld import AuthenticationError, NetworkError, TOTPRequiredError
 
 from arvancld_telegram.config import Settings
 from arvancld_telegram.gateway import (
     ArvanCloudGateway,
+    AuthenticationBusyError,
+    AuthenticationState,
+    InteractiveAuthenticationRequired,
+    OTPFlowExpiredError,
+    OTPRejectedError,
+    OTPSubmissionUncertainError,
     ProtectedRecordError,
     StaleRecordError,
 )
@@ -30,12 +37,14 @@ def page() -> SimpleNamespace:
     return SimpleNamespace(data=[], meta=SimpleNamespace(last_page=1, total=0))
 
 
-def fake_client() -> SimpleNamespace:
+def fake_client(*, authenticated: bool = True) -> SimpleNamespace:
     auth = SimpleNamespace(
-        tokens=object(),
+        tokens=object() if authenticated else None,
+        pending_totp=None,
         aload_session=AsyncMock(),
         asave_session=AsyncMock(),
         login=AsyncMock(),
+        submit_totp=AsyncMock(),
         refresh=AsyncMock(),
     )
     dns_records = SimpleNamespace(
@@ -52,6 +61,22 @@ def fake_client() -> SimpleNamespace:
         is_closed=False,
         close=AsyncMock(),
     )
+
+
+def require_totp(auth: SimpleNamespace):
+    async def challenge(*_args) -> None:
+        auth.pending_totp = object()
+        raise TOTPRequiredError("OTP required")
+
+    return challenge
+
+
+def complete_totp(auth: SimpleNamespace):
+    async def complete(_code: str) -> None:
+        auth.pending_totp = None
+        auth.tokens = object()
+
+    return complete
 
 
 async def test_start_uses_loaded_session_and_validates_access(tmp_path) -> None:
@@ -74,6 +99,121 @@ async def test_start_logs_in_when_session_is_missing(tmp_path) -> None:
 
     client.auth.login.assert_awaited_once_with("admin@example.test", "secret")
     client.auth.asave_session.assert_awaited_once()
+
+
+async def test_start_enters_otp_mode_without_validating_domains(tmp_path) -> None:
+    client = fake_client(authenticated=False)
+    client.auth.aload_session.side_effect = FileNotFoundError
+    client.auth.login.side_effect = require_totp(client.auth)
+    gateway = ArvanCloudGateway(settings(tmp_path), client=client)
+
+    result = await gateway.start()
+
+    assert result is AuthenticationState.OTP_REQUIRED
+    assert gateway.auth_status == "OTP required"
+    assert gateway.challenge_revision == 1
+    client.cdn.domains.list.assert_not_awaited()
+
+
+async def test_start_enters_otp_mode_after_loaded_session_recovery(tmp_path) -> None:
+    client = fake_client()
+    client.cdn.domains.list.side_effect = AuthenticationError(status_code=401)
+    client.auth.refresh.side_effect = AuthenticationError(status_code=401)
+    client.auth.login.side_effect = require_totp(client.auth)
+    gateway = ArvanCloudGateway(settings(tmp_path), client=client)
+
+    result = await gateway.start()
+
+    assert result is AuthenticationState.OTP_REQUIRED
+    client.cdn.domains.list.assert_awaited_once()
+    client.auth.refresh.assert_awaited_once()
+    client.auth.login.assert_awaited_once()
+
+
+async def test_valid_totp_saves_validates_and_connects(tmp_path) -> None:
+    client = fake_client(authenticated=False)
+    client.auth.aload_session.side_effect = FileNotFoundError
+    client.auth.login.side_effect = require_totp(client.auth)
+    client.auth.submit_totp.side_effect = complete_totp(client.auth)
+    gateway = ArvanCloudGateway(settings(tmp_path), client=client)
+    await gateway.start()
+    await gateway.begin_authentication(1)
+
+    await gateway.submit_totp(1, "246810")
+
+    assert gateway.connected
+    client.auth.submit_totp.assert_awaited_once_with("246810")
+    client.auth.asave_session.assert_awaited_once()
+    client.cdn.domains.list.assert_awaited_once_with(page=1, per_page=1)
+
+
+async def test_first_admin_owns_challenge_until_cancel(tmp_path) -> None:
+    client = fake_client(authenticated=False)
+    client.auth.aload_session.side_effect = FileNotFoundError
+    client.auth.login.side_effect = require_totp(client.auth)
+    gateway = ArvanCloudGateway(settings(tmp_path), client=client)
+    await gateway.start()
+    await gateway.begin_authentication(1)
+
+    with pytest.raises(AuthenticationBusyError):
+        await gateway.begin_authentication(2)
+
+    assert await gateway.cancel_authentication(1)
+    assert not await gateway.cancel_authentication(2)
+    assert await gateway.begin_authentication(2) is AuthenticationState.OTP_REQUIRED
+    assert client.auth.login.await_count == 2
+
+
+async def test_otp_owner_expiry_requires_a_fresh_login(tmp_path) -> None:
+    now = [100.0]
+    client = fake_client(authenticated=False)
+    client.auth.aload_session.side_effect = FileNotFoundError
+    client.auth.login.side_effect = require_totp(client.auth)
+    gateway = ArvanCloudGateway(settings(tmp_path), client=client, clock=lambda: now[0])
+    await gateway.start()
+    await gateway.begin_authentication(1)
+    now[0] += 301
+
+    with pytest.raises(OTPFlowExpiredError):
+        await gateway.submit_totp(1, "246810")
+
+    assert await gateway.begin_authentication(2) is AuthenticationState.OTP_REQUIRED
+    assert client.auth.login.await_count == 2
+
+
+async def test_rejected_totp_is_single_attempt_and_keeps_owner(tmp_path) -> None:
+    client = fake_client(authenticated=False)
+    client.auth.aload_session.side_effect = FileNotFoundError
+    client.auth.login.side_effect = require_totp(client.auth)
+    client.auth.submit_totp.side_effect = AuthenticationError(status_code=401)
+    gateway = ArvanCloudGateway(settings(tmp_path), client=client)
+    await gateway.start()
+    await gateway.begin_authentication(1)
+
+    with pytest.raises(OTPRejectedError):
+        await gateway.submit_totp(1, "246810")
+
+    assert gateway.auth_state is AuthenticationState.OTP_REQUIRED
+    client.auth.submit_totp.assert_awaited_once()
+    with pytest.raises(AuthenticationBusyError):
+        await gateway.begin_authentication(2)
+
+
+async def test_uncertain_totp_is_not_retried_and_forces_fresh_login(tmp_path) -> None:
+    client = fake_client(authenticated=False)
+    client.auth.aload_session.side_effect = FileNotFoundError
+    client.auth.login.side_effect = require_totp(client.auth)
+    client.auth.submit_totp.side_effect = NetworkError("network failed")
+    gateway = ArvanCloudGateway(settings(tmp_path), client=client)
+    await gateway.start()
+    await gateway.begin_authentication(1)
+
+    with pytest.raises(OTPSubmissionUncertainError):
+        await gateway.submit_totp(1, "246810")
+    with pytest.raises(OTPFlowExpiredError):
+        await gateway.submit_totp(1, "246810")
+
+    client.auth.submit_totp.assert_awaited_once()
 
 
 async def test_authentication_failure_refreshes_and_retries_once(tmp_path) -> None:
@@ -122,6 +262,49 @@ async def test_network_failure_during_mutation_is_not_retried(tmp_path) -> None:
 
     client.cdn.dns_records.create.assert_awaited_once()
     client.auth.refresh.assert_not_awaited()
+
+
+async def test_mutation_interrupted_by_totp_is_not_replayed(tmp_path) -> None:
+    client = fake_client()
+    client.cdn.dns_records.create.side_effect = AuthenticationError(status_code=401)
+    client.auth.refresh.side_effect = AuthenticationError(status_code=401)
+    client.auth.login.side_effect = require_totp(client.auth)
+    gateway = ArvanCloudGateway(settings(tmp_path), client=client)
+
+    with pytest.raises(InteractiveAuthenticationRequired):
+        await gateway.create_record("example.test", SimpleNamespace())
+
+    assert gateway.auth_state is AuthenticationState.OTP_REQUIRED
+    client.cdn.dns_records.create.assert_awaited_once()
+    client.auth.refresh.assert_awaited_once()
+    client.auth.login.assert_awaited_once()
+
+
+async def test_concurrent_auth_failures_share_one_totp_recovery(tmp_path) -> None:
+    client = fake_client()
+    refresh_started = asyncio.Event()
+    release_refresh = asyncio.Event()
+    client.cdn.domains.list.side_effect = AuthenticationError(status_code=401)
+
+    async def rejected_refresh() -> None:
+        refresh_started.set()
+        await release_refresh.wait()
+        raise AuthenticationError(status_code=401)
+
+    client.auth.refresh.side_effect = rejected_refresh
+    client.auth.login.side_effect = require_totp(client.auth)
+    gateway = ArvanCloudGateway(settings(tmp_path), client=client)
+
+    first = asyncio.create_task(gateway.list_domains(page=1))
+    await refresh_started.wait()
+    second = asyncio.create_task(gateway.list_domains(page=1))
+    release_refresh.set()
+
+    results = await asyncio.gather(first, second, return_exceptions=True)
+
+    assert all(isinstance(result, InteractiveAuthenticationRequired) for result in results)
+    client.auth.refresh.assert_awaited_once()
+    client.auth.login.assert_awaited_once()
 
 
 async def test_current_record_guard_rejects_stale_and_protected(

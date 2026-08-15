@@ -29,6 +29,12 @@ from arvancld_telegram.dns import (
 )
 from arvancld_telegram.gateway import (
     ArvanCloudGateway,
+    AuthenticationBusyError,
+    AuthenticationState,
+    InteractiveAuthenticationRequired,
+    OTPFlowExpiredError,
+    OTPRejectedError,
+    OTPSubmissionUncertainError,
     ProtectedRecordError,
     StaleRecordError,
 )
@@ -59,9 +65,11 @@ class BotController:
         self.settings = settings
         self.gateway = gateway
         self.store = store or ConversationStore()
+        self._last_notified_challenge_revision = 0
 
     def register_handlers(self) -> None:
         self.bot.register_message_handler(self.handle_start, commands=["start", "domains"])
+        self.bot.register_message_handler(self.handle_auth, commands=["auth"])
         self.bot.register_message_handler(self.handle_status, commands=["status"])
         self.bot.register_message_handler(self.handle_help, commands=["help"])
         self.bot.register_message_handler(self.handle_cancel, commands=["cancel"])
@@ -92,8 +100,64 @@ class BotController:
             state = self.store.get(user_id)
             try:
                 await handler(message, state)
+            except InteractiveAuthenticationRequired:
+                await self._request_authentication(chat_id, user_id, self.store.get(user_id))
             except Exception as exc:  # handlers must never terminate polling
                 await self._report_error(chat_id, exc)
+
+    async def notify_auth_required(self, *, exclude_chat_id: int | None = None) -> None:
+        """Best-effort notify every configured administrator once per challenge."""
+
+        revision = self.gateway.challenge_revision
+        if not self.gateway.otp_required or revision <= self._last_notified_challenge_revision:
+            return
+        self._last_notified_challenge_revision = revision
+        for admin_id in sorted(self.settings.telegram_admin_ids):
+            if admin_id == exclude_chat_id:
+                continue
+            try:
+                await self.bot.send_message(
+                    admin_id,
+                    "<b>ArvanCloud OTP required</b>\n"
+                    "Run /auth in this private chat to complete account login.",
+                )
+            except Exception:
+                logger.warning(
+                    "could not notify Telegram admin actor_id=%s about OTP",
+                    admin_id,
+                )
+
+    async def _request_authentication(
+        self,
+        chat_id: int,
+        actor_id: int,
+        state: UserState,
+    ) -> bool:
+        """Claim the current OTP challenge or perform non-TOTP login."""
+
+        try:
+            result = await self.gateway.begin_authentication(actor_id)
+        except AuthenticationBusyError:
+            await self.bot.send_message(
+                chat_id, "Another administrator is completing ArvanCloud authentication."
+            )
+            return False
+
+        if result is AuthenticationState.CONNECTED:
+            state.clear_transient()
+            await self.bot.send_message(chat_id, "ArvanCloud authentication is complete.")
+            return True
+
+        state.clear_transient()
+        state.flow = "auth_totp"
+        await self.notify_auth_required(exclude_chat_id=chat_id)
+        await self.bot.send_message(
+            chat_id,
+            "<b>ArvanCloud OTP required</b>\n"
+            "Send the current six-digit authenticator code. "
+            "The bot will delete your message immediately.",
+        )
+        return False
 
     async def _report_error(self, chat_id: int | None, exc: Exception) -> None:
         if chat_id is None:
@@ -123,19 +187,42 @@ class BotController:
         async def start(inner: Any, _state: UserState) -> None:
             user_id = inner.from_user.id
             state = self.store.reset(user_id)
+            if not self.gateway.connected and not await self._request_authentication(
+                inner.chat.id, user_id, state
+            ):
+                return
             await self._show_domains(inner.chat.id, state, page=1)
 
         await self._authorized_message(message, start)
 
+    async def handle_auth(self, message: Any) -> None:
+        async def authenticate(inner: Any, state: UserState) -> None:
+            if self.gateway.connected:
+                state.touch()
+                await self.bot.send_message(inner.chat.id, "ArvanCloud is already connected.")
+                return
+            await self._request_authentication(inner.chat.id, inner.from_user.id, state)
+
+        await self._authorized_message(message, authenticate)
+
     async def handle_status(self, message: Any) -> None:
         async def status(inner: Any, state: UserState) -> None:
-            page = await self.gateway.list_domains(page=1, per_page=1)
             state.touch()
-            connection = "connected" if self.gateway.connected else "disconnected"
+            if not self.gateway.connected:
+                await self.bot.send_message(
+                    inner.chat.id,
+                    "<b>Status</b>\n"
+                    "Telegram: connected\n"
+                    f"ArvanCloud: {html.escape(self.gateway.auth_status)}\n"
+                    "Run /auth to complete account login.",
+                )
+                return
+
+            page = await self.gateway.list_domains(page=1, per_page=1)
             await self.bot.send_message(
                 inner.chat.id,
                 "<b>Status</b>\n"
-                f"Telegram: connected\nArvanCloud: {connection}\n"
+                "Telegram: connected\nArvanCloud: connected\n"
                 f"Domains: {page.meta.total}",
             )
 
@@ -148,6 +235,7 @@ class BotController:
                 inner.chat.id,
                 "<b>ArvanCloud DNS Admin</b>\n"
                 "/domains — browse domains and DNS records\n"
+                "/auth — complete or restart ArvanCloud login\n"
                 "/status — verify account connectivity\n"
                 "/cancel — cancel the current input or confirmation\n\n"
                 "Supported records: " + ", ".join(RECORD_TYPES) + "\n"
@@ -158,8 +246,20 @@ class BotController:
 
     async def handle_cancel(self, message: Any) -> None:
         async def cancel(inner: Any, state: UserState) -> None:
+            cancelling_auth = state.flow == "auth_totp"
             state.clear_transient()
+            if cancelling_auth:
+                await self.gateway.cancel_authentication(inner.from_user.id)
+                await self.bot.send_message(
+                    inner.chat.id, "Authentication cancelled. Run /auth to start a fresh login."
+                )
+                return
             await self.bot.send_message(inner.chat.id, "Cancelled.")
+            if not self.gateway.connected:
+                await self.bot.send_message(
+                    inner.chat.id, "ArvanCloud is not connected. Run /auth to continue."
+                )
+                return
             if state.selected_record is not None:
                 await self._show_record_detail(inner.chat.id, state, state.selected_record)
             elif state.selected_domain is not None:
@@ -173,6 +273,10 @@ class BotController:
         await self._authorized_message(message, self._handle_text)
 
     async def _handle_text(self, message: Any, state: UserState) -> None:
+        if state.flow == "auth_totp":
+            await self._handle_totp(message, state)
+            return
+
         text = (message.text or "").strip()
         if not state.flow:
             await self.bot.send_message(message.chat.id, "Use /domains to open the DNS menu.")
@@ -239,6 +343,47 @@ class BotController:
         state.clear_transient()
         await self.bot.send_message(message.chat.id, "That input is no longer expected.")
 
+    async def _handle_totp(self, message: Any, state: UserState) -> None:
+        """Delete and submit one user-supplied OTP without retaining its value."""
+
+        try:
+            await self.bot.delete_message(message.chat.id, message.message_id)
+        except Exception:
+            logger.warning(
+                "could not delete Telegram OTP message actor_id=%s message_id=%s",
+                message.from_user.id,
+                getattr(message, "message_id", None),
+            )
+
+        code = (message.text or "").strip()
+        try:
+            await self.gateway.submit_totp(message.from_user.id, code)
+        except ValueError:
+            await self.bot.send_message(
+                message.chat.id, "Invalid OTP format. Send exactly six ASCII digits."
+            )
+            return
+        except OTPRejectedError:
+            await self.bot.send_message(
+                message.chat.id,
+                "That OTP was rejected or expired. Send a new current six-digit code.",
+            )
+            return
+        except (OTPFlowExpiredError, OTPSubmissionUncertainError):
+            state.clear_transient()
+            await self.bot.send_message(
+                message.chat.id,
+                "The OTP flow cannot be reused safely. Run /auth to start a fresh login.",
+            )
+            return
+
+        state.clear_transient()
+        await self.bot.send_message(
+            message.chat.id,
+            "ArvanCloud authentication succeeded. "
+            "Use /domains or repeat the interrupted operation.",
+        )
+
     async def handle_callback(self, call: Any) -> None:
         try:
             await self.bot.answer_callback_query(call.id)
@@ -266,6 +411,8 @@ class BotController:
                     await self.bot.send_message(chat_id, "That menu expired. Open /domains again.")
                     return
                 await self._dispatch_callback(call, state, action, argument)
+            except InteractiveAuthenticationRequired:
+                await self._request_authentication(chat_id, user_id, state)
             except Exception as exc:  # handlers must never terminate polling
                 await self._report_error(chat_id, exc)
 
@@ -850,6 +997,16 @@ class BotController:
                 confirmation.domain,
                 confirmation.record_id or (str(result.id) if result else None),
             )
+        except InteractiveAuthenticationRequired:
+            logger.info(
+                "dns mutation actor_id=%s action=%s domain=%s record_id=%s "
+                "outcome=authentication_required",
+                actor_id,
+                confirmation.kind,
+                confirmation.domain,
+                confirmation.record_id,
+            )
+            raise
         except NetworkError:
             logger.warning(
                 "dns mutation actor_id=%s action=%s domain=%s record_id=%s outcome=unknown",
