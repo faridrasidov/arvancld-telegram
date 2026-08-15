@@ -1,0 +1,44 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "arvancld-telegram"
+version = "0.1.0"
+description = "Private Telegram DNS administration bot for ArvanCloud"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "arvancld @ https://github.com/faridrasidov/arvancld/archive/c71a3fee9597adc98ce1b9c2044254932b7b1e68.zip",
+    "pyTelegramBotAPI==4.34.0",
+    "python-dotenv>=1.0,<2",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.2,<9",
+    "pytest-asyncio>=0.23,<1",
+    "ruff>=0.5",
+]
+
+[project.scripts]
+arvancld-telegram = "arvancld_telegram.__main__:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/arvancld_telegram"]
+
+[tool.hatch.metadata]
+allow-direct-references = true
+
+[tool.pytest.ini_options]
+addopts = "-q"
+asyncio_mode = "auto"
+pythonpath = ["src"]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["B", "E", "F", "I", "RUF", "SIM", "UP"]
