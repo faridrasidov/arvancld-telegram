@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -51,6 +52,7 @@ class FakeGateway:
         self.otp_required = False
         self.auth_status = "connected"
         self.challenge_revision = 0
+        self.auth_attempt_id = "attempt-test"
         self.begin_authentication = AsyncMock(return_value=AuthenticationState.CONNECTED)
         self.submit_totp = AsyncMock()
         self.cancel_authentication = AsyncMock(return_value=True)
@@ -166,7 +168,25 @@ async def test_totp_message_is_deleted_and_submitted_once() -> None:
     assert all("246810" not in text for _, text, _ in bot.sent)
 
 
-async def test_totp_submission_continues_when_message_deletion_fails() -> None:
+async def test_malformed_totp_is_deleted_logged_safely_and_not_submitted(caplog) -> None:
+    caplog.set_level(logging.INFO, logger="arvancld_telegram.controller")
+    bot = FakeBot()
+    gateway = FakeGateway()
+    controller = BotController(bot, settings(), gateway)  # type: ignore[arg-type]
+    controller.store.get(1).flow = "auth_totp"
+
+    await controller.handle_text(message(text="12secret", message_id=45))
+
+    assert bot.deleted == [(1, 45)]
+    gateway.submit_totp.assert_not_awaited()
+    assert controller.store.get(1).flow == "auth_totp"
+    assert "event=telegram_otp_received" in caplog.text
+    assert "event=telegram_otp_format_rejected" in caplog.text
+    assert "12secret" not in caplog.text
+
+
+async def test_totp_submission_continues_when_message_deletion_fails(caplog) -> None:
+    caplog.set_level(logging.INFO, logger="arvancld_telegram.controller")
     bot = FakeBot()
     bot.fail_delete = True
     gateway = FakeGateway()
@@ -177,6 +197,9 @@ async def test_totp_submission_continues_when_message_deletion_fails() -> None:
 
     gateway.submit_totp.assert_awaited_once_with(1, "246810")
     assert all("246810" not in text for _, text, _ in bot.sent)
+    assert "event=telegram_otp_delete_failed" in caplog.text
+    assert "event=telegram_otp_format_accepted" in caplog.text
+    assert "246810" not in caplog.text
 
 
 async def test_invalid_or_rejected_totp_keeps_prompt_without_leaking_code() -> None:

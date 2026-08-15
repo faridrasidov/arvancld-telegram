@@ -123,7 +123,10 @@ class BotController:
                 )
             except Exception:
                 logger.warning(
-                    "could not notify Telegram admin actor_id=%s about OTP",
+                    "auth event=telegram_otp_notification_failed attempt_id=%s "
+                    "challenge_revision=%s actor_id=%s",
+                    self.gateway.auth_attempt_id or "unavailable",
+                    self.gateway.challenge_revision,
                     admin_id,
                 )
 
@@ -346,18 +349,62 @@ class BotController:
     async def _handle_totp(self, message: Any, state: UserState) -> None:
         """Delete and submit one user-supplied OTP without retaining its value."""
 
+        attempt_id = self.gateway.auth_attempt_id or "unavailable"
+        revision = self.gateway.challenge_revision
+        actor_id = message.from_user.id
+        message_id = getattr(message, "message_id", None)
+        logger.info(
+            "auth event=telegram_otp_received attempt_id=%s challenge_revision=%s "
+            "actor_id=%s message_id=%s",
+            attempt_id,
+            revision,
+            actor_id,
+            message_id,
+        )
         try:
             await self.bot.delete_message(message.chat.id, message.message_id)
         except Exception:
             logger.warning(
-                "could not delete Telegram OTP message actor_id=%s message_id=%s",
-                message.from_user.id,
-                getattr(message, "message_id", None),
+                "auth event=telegram_otp_delete_failed attempt_id=%s "
+                "challenge_revision=%s actor_id=%s message_id=%s",
+                attempt_id,
+                revision,
+                actor_id,
+                message_id,
+            )
+        else:
+            logger.info(
+                "auth event=telegram_otp_deleted attempt_id=%s challenge_revision=%s "
+                "actor_id=%s message_id=%s",
+                attempt_id,
+                revision,
+                actor_id,
+                message_id,
             )
 
         code = (message.text or "").strip()
+        if len(code) != 6 or not code.isascii() or not code.isdigit():
+            logger.warning(
+                "auth event=telegram_otp_format_rejected attempt_id=%s "
+                "challenge_revision=%s actor_id=%s",
+                attempt_id,
+                revision,
+                actor_id,
+            )
+            await self.bot.send_message(
+                message.chat.id, "Invalid OTP format. Send exactly six ASCII digits."
+            )
+            return
+
+        logger.info(
+            "auth event=telegram_otp_format_accepted attempt_id=%s "
+            "challenge_revision=%s actor_id=%s",
+            attempt_id,
+            revision,
+            actor_id,
+        )
         try:
-            await self.gateway.submit_totp(message.from_user.id, code)
+            await self.gateway.submit_totp(actor_id, code)
         except ValueError:
             await self.bot.send_message(
                 message.chat.id, "Invalid OTP format. Send exactly six ASCII digits."

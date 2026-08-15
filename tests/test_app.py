@@ -2,12 +2,24 @@
 
 from __future__ import annotations
 
+import logging
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 from arvancld_telegram import app
 from arvancld_telegram.config import Settings
 from arvancld_telegram.gateway import AuthenticationState
+
+
+def test_sdk_provenance_log_is_safe_and_reports_totp_capability(caplog, monkeypatch) -> None:
+    caplog.set_level(logging.INFO, logger="arvancld_telegram.app")
+    monkeypatch.setenv("ARVANCLD_SDK_REF", "sdk-sha-test")
+
+    app.log_sdk_provenance()
+
+    assert "sha=sdk-sha-test" in caplog.text
+    assert "submit_totp=True" in caplog.text
+    assert "module=" in caplog.text
 
 
 async def test_handlers_and_otp_notification_are_ready_before_polling(

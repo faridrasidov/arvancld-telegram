@@ -1,6 +1,9 @@
 services:
   bot:
-    build: .
+    build:
+      context: .
+      args:
+        ARVANCLD_GIT_REF: 19f8b49b993bbec935f7cd61bbb65ff9bcb1982f
     env_file:
       - .env
     environment:

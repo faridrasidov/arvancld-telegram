@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import secrets
 import time
 from collections.abc import Awaitable, Callable
 from enum import Enum
@@ -19,6 +20,7 @@ from arvancld import (
     DNSRecordDeleteResult,
     DNSRecordPage,
     DNSRecordUpdate,
+    InvalidResponseError,
     InvalidSessionError,
     NetworkError,
     SessionExpiredError,
@@ -94,6 +96,7 @@ class ArvanCloudGateway:
         self._otp_owner_expires_at = 0.0
         self._otp_requires_restart = False
         self._challenge_revision = 0
+        self._auth_attempt_id: str | None = None
 
     @property
     def auth_state(self) -> AuthenticationState:
@@ -108,6 +111,12 @@ class ArvanCloudGateway:
         """Monotonic identifier used to avoid duplicate admin notifications."""
 
         return self._challenge_revision
+
+    @property
+    def auth_attempt_id(self) -> str | None:
+        """Opaque correlation identifier for the current authentication attempt."""
+
+        return self._auth_attempt_id
 
     @property
     def connected(self) -> bool:
@@ -137,10 +146,12 @@ class ArvanCloudGateway:
                     return self._auth_state
 
             try:
+                self._log_validation_started()
                 await self._call(
                     lambda: self._client.cdn.domains.list(page=1, per_page=1),
                     require_ready=False,
                 )
+                self._log_validation_completed()
             except InteractiveAuthenticationRequired:
                 return self._auth_state
         except Exception:
@@ -171,12 +182,8 @@ class ArvanCloudGateway:
                 self._claim_otp(actor_id)
                 return self._auth_state
 
-            self._auth_state = AuthenticationState.AUTHENTICATING
             try:
-                await self._client.auth.login(
-                    self._settings.arvancld_email,
-                    self._settings.arvancld_password,
-                )
+                await self._login_and_save()
             except TOTPRequiredError:
                 self._set_totp_required(owner_id=actor_id)
                 return self._auth_state
@@ -186,7 +193,6 @@ class ArvanCloudGateway:
                 raise
 
             try:
-                await self._client.auth.asave_session(self._session_path)
                 await self._validate_access_once()
             except Exception:
                 self._auth_state = AuthenticationState.UNAVAILABLE
@@ -210,30 +216,82 @@ class ArvanCloudGateway:
             if not self.otp_required or self._client.auth.pending_totp is None:
                 raise OTPFlowExpiredError("The OTP prompt expired; run /auth again")
 
+            attempt_id = self._attempt_id()
+            revision = self._challenge_revision
+            started_at = time.perf_counter()
             self._auth_state = AuthenticationState.AUTHENTICATING
+            logger.info(
+                "auth event=totp_sdk_submission_started attempt_id=%s "
+                "challenge_revision=%s actor_id=%s",
+                attempt_id,
+                revision,
+                actor_id,
+            )
             try:
                 await self._client.auth.submit_totp(code)
             except ValueError:
                 self._auth_state = AuthenticationState.OTP_REQUIRED
+                logger.warning(
+                    "auth event=totp_sdk_submission_rejected attempt_id=%s "
+                    "challenge_revision=%s actor_id=%s reason=format elapsed_ms=%s",
+                    attempt_id,
+                    revision,
+                    actor_id,
+                    self._elapsed_ms(started_at),
+                )
                 raise
             except AuthenticationError as exc:
                 self._auth_state = AuthenticationState.OTP_REQUIRED
+                self._log_api_rejection(exc, actor_id=actor_id, started_at=started_at)
                 raise OTPRejectedError("The OTP was rejected or expired") from exc
             except APIError as exc:
                 self._auth_state = AuthenticationState.OTP_REQUIRED
-                if exc.status_code == 400:
+                self._log_api_rejection(exc, actor_id=actor_id, started_at=started_at)
+                if exc.status_code in {400, 422}:
                     raise OTPRejectedError("The OTP was rejected or expired") from exc
                 raise
+            except InvalidResponseError as exc:
+                logger.warning(
+                    "auth event=totp_sdk_submission_invalid_response attempt_id=%s "
+                    "challenge_revision=%s actor_id=%s elapsed_ms=%s",
+                    attempt_id,
+                    revision,
+                    actor_id,
+                    self._elapsed_ms(started_at),
+                )
+                self._abandon_otp_for_restart()
+                raise OTPSubmissionUncertainError(
+                    "The OTP response could not be validated; start a fresh login"
+                ) from exc
             except NetworkError as exc:
+                logger.warning(
+                    "auth event=totp_sdk_submission_uncertain attempt_id=%s "
+                    "challenge_revision=%s actor_id=%s elapsed_ms=%s",
+                    attempt_id,
+                    revision,
+                    actor_id,
+                    self._elapsed_ms(started_at),
+                )
                 self._abandon_otp_for_restart()
                 raise OTPSubmissionUncertainError(
                     "The OTP result is unknown; start a fresh login"
                 ) from exc
 
+            logger.info(
+                "auth event=totp_sdk_submission_accepted attempt_id=%s "
+                "challenge_revision=%s actor_id=%s status=success "
+                "request_id=unavailable elapsed_ms=%s",
+                attempt_id,
+                revision,
+                actor_id,
+                self._elapsed_ms(started_at),
+            )
+
             try:
-                await self._client.auth.asave_session(self._session_path)
+                await self._save_session()
                 await self._validate_access_once()
-            except Exception:
+            except Exception as exc:
+                self._log_post_submission_failure(exc)
                 self._auth_state = AuthenticationState.UNAVAILABLE
                 self._clear_otp_owner()
                 raise
@@ -247,28 +305,62 @@ class ArvanCloudGateway:
             self._expire_otp_owner()
             if self._otp_owner_id != actor_id:
                 return False
+            logger.info(
+                "auth event=totp_cancelled attempt_id=%s challenge_revision=%s actor_id=%s",
+                self._attempt_id(),
+                self._challenge_revision,
+                actor_id,
+            )
             self._abandon_otp_for_restart()
             return True
 
     async def _login_and_save(self) -> None:
+        self._auth_state = AuthenticationState.AUTHENTICATING
+        self._auth_attempt_id = secrets.token_hex(6)
+        logger.info(
+            "auth event=password_login_started attempt_id=%s",
+            self._auth_attempt_id,
+        )
         await self._client.auth.login(
             self._settings.arvancld_email,
             self._settings.arvancld_password,
         )
+        logger.info(
+            "auth event=password_login_accepted attempt_id=%s",
+            self._auth_attempt_id,
+        )
+        await self._save_session()
+
+    async def _save_session(self) -> None:
+        logger.info(
+            "auth event=session_save_started attempt_id=%s challenge_revision=%s",
+            self._attempt_id(),
+            self._challenge_revision,
+        )
         await self._client.auth.asave_session(self._session_path)
-        logger.info("created ArvanCloud session path=%s", self._session_path)
+        logger.info(
+            "auth event=session_saved attempt_id=%s challenge_revision=%s",
+            self._attempt_id(),
+            self._challenge_revision,
+        )
 
     async def _validate_access_once(self) -> None:
+        self._log_validation_started()
         await self._client.cdn.domains.list(page=1, per_page=1)
+        self._log_validation_completed()
 
     def _set_totp_required(self, owner_id: int | None = None) -> None:
         self._auth_state = AuthenticationState.OTP_REQUIRED
         self._otp_requires_restart = False
         self._challenge_revision += 1
         self._clear_otp_owner()
+        logger.info(
+            "auth event=totp_required attempt_id=%s challenge_revision=%s",
+            self._attempt_id(),
+            self._challenge_revision,
+        )
         if owner_id is not None:
             self._claim_otp(owner_id)
-        logger.info("ArvanCloud login requires interactive OTP")
 
     def _mark_connected(self) -> None:
         self._auth_state = AuthenticationState.CONNECTED
@@ -278,6 +370,14 @@ class ArvanCloudGateway:
     def _claim_otp(self, actor_id: int) -> None:
         self._otp_owner_id = actor_id
         self._otp_owner_expires_at = self._clock() + OTP_OWNER_TTL_SECONDS
+        logger.info(
+            "auth event=totp_claimed attempt_id=%s challenge_revision=%s "
+            "actor_id=%s lease_seconds=%s",
+            self._attempt_id(),
+            self._challenge_revision,
+            actor_id,
+            OTP_OWNER_TTL_SECONDS,
+        )
 
     def _clear_otp_owner(self) -> None:
         self._otp_owner_id = None
@@ -291,10 +391,96 @@ class ArvanCloudGateway:
     def _expire_otp_owner(self) -> None:
         if self._otp_owner_id is None or self._clock() < self._otp_owner_expires_at:
             return
+        logger.warning(
+            "auth event=totp_ownership_expired attempt_id=%s challenge_revision=%s actor_id=%s",
+            self._attempt_id(),
+            self._challenge_revision,
+            self._otp_owner_id,
+        )
         self._abandon_otp_for_restart()
 
     def _active_otp_owner_is_other(self, actor_id: int) -> bool:
         return self._otp_owner_id is not None and self._otp_owner_id != actor_id
+
+    def _attempt_id(self) -> str:
+        if self._auth_attempt_id is None:
+            self._auth_attempt_id = secrets.token_hex(6)
+        return self._auth_attempt_id
+
+    @staticmethod
+    def _elapsed_ms(started_at: float) -> int:
+        return max(0, round((time.perf_counter() - started_at) * 1000))
+
+    def _log_api_rejection(
+        self,
+        exc: APIError,
+        *,
+        actor_id: int,
+        started_at: float,
+    ) -> None:
+        logger.warning(
+            "auth event=totp_sdk_submission_rejected attempt_id=%s "
+            "challenge_revision=%s actor_id=%s status=%s request_id=%s elapsed_ms=%s",
+            self._attempt_id(),
+            self._challenge_revision,
+            actor_id,
+            exc.status_code,
+            exc.request_id or "unavailable",
+            self._elapsed_ms(started_at),
+        )
+        logger.debug(
+            "auth event=totp_sdk_submission_diagnostics attempt_id=%s "
+            "challenge_revision=%s content_type=%s body_size=%s fields=%s issues=%s",
+            self._attempt_id(),
+            self._challenge_revision,
+            exc.response_content_type or "unavailable",
+            exc.response_size,
+            exc.response_fields,
+            tuple((issue.location, issue.error_type) for issue in exc.validation_issues),
+        )
+
+    def _log_post_submission_failure(self, exc: Exception) -> None:
+        if isinstance(exc, APIError):
+            logger.warning(
+                "auth event=post_submission_failed attempt_id=%s challenge_revision=%s "
+                "stage=session_or_cdn status=%s request_id=%s",
+                self._attempt_id(),
+                self._challenge_revision,
+                exc.status_code,
+                exc.request_id or "unavailable",
+            )
+            logger.debug(
+                "auth event=post_submission_diagnostics attempt_id=%s "
+                "challenge_revision=%s content_type=%s body_size=%s fields=%s issues=%s",
+                self._attempt_id(),
+                self._challenge_revision,
+                exc.response_content_type or "unavailable",
+                exc.response_size,
+                exc.response_fields,
+                tuple((issue.location, issue.error_type) for issue in exc.validation_issues),
+            )
+            return
+        logger.warning(
+            "auth event=post_submission_failed attempt_id=%s challenge_revision=%s "
+            "stage=session_or_cdn error_type=%s",
+            self._attempt_id(),
+            self._challenge_revision,
+            type(exc).__name__,
+        )
+
+    def _log_validation_started(self) -> None:
+        logger.info(
+            "auth event=cdn_validation_started attempt_id=%s challenge_revision=%s",
+            self._attempt_id(),
+            self._challenge_revision,
+        )
+
+    def _log_validation_completed(self) -> None:
+        logger.info(
+            "auth event=cdn_validation_completed attempt_id=%s challenge_revision=%s",
+            self._attempt_id(),
+            self._challenge_revision,
+        )
 
     async def _recover_auth(self, failed_tokens: object) -> None:
         async with self._auth_lock:
@@ -310,7 +496,7 @@ class ArvanCloudGateway:
                 try:
                     self._auth_state = AuthenticationState.AUTHENTICATING
                     await self._client.auth.refresh()
-                    await self._client.auth.asave_session(self._session_path)
+                    await self._save_session()
                     self._mark_connected()
                     logger.info("refreshed ArvanCloud session")
                 except AuthenticationError:

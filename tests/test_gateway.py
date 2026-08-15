@@ -3,11 +3,19 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
-from arvancld import AuthenticationError, NetworkError, TOTPRequiredError
+from arvancld import (
+    APIError,
+    APIValidationIssue,
+    AuthenticationError,
+    InvalidResponseError,
+    NetworkError,
+    TOTPRequiredError,
+)
 
 from arvancld_telegram.config import Settings
 from arvancld_telegram.gateway import (
@@ -130,7 +138,8 @@ async def test_start_enters_otp_mode_after_loaded_session_recovery(tmp_path) -> 
     client.auth.login.assert_awaited_once()
 
 
-async def test_valid_totp_saves_validates_and_connects(tmp_path) -> None:
+async def test_valid_totp_saves_validates_and_connects(tmp_path, caplog) -> None:
+    caplog.set_level(logging.INFO, logger="arvancld_telegram.gateway")
     client = fake_client(authenticated=False)
     client.auth.aload_session.side_effect = FileNotFoundError
     client.auth.login.side_effect = require_totp(client.auth)
@@ -145,6 +154,31 @@ async def test_valid_totp_saves_validates_and_connects(tmp_path) -> None:
     client.auth.submit_totp.assert_awaited_once_with("246810")
     client.auth.asave_session.assert_awaited_once()
     client.cdn.domains.list.assert_awaited_once_with(page=1, per_page=1)
+    events = [
+        record.message.split("event=", 1)[1].split(" ", 1)[0]
+        for record in caplog.records
+        if "event=" in record.message
+    ]
+    assert events == [
+        "password_login_started",
+        "totp_required",
+        "totp_claimed",
+        "totp_sdk_submission_started",
+        "totp_sdk_submission_accepted",
+        "session_save_started",
+        "session_saved",
+        "cdn_validation_started",
+        "cdn_validation_completed",
+    ]
+    attempt_ids = {
+        part.split("=", 1)[1]
+        for record in caplog.records
+        for part in record.message.split()
+        if part.startswith("attempt_id=")
+    }
+    assert len(attempt_ids) == 1
+    assert "246810" not in caplog.text
+    assert "secret" not in caplog.text
 
 
 async def test_first_admin_owns_challenge_until_cancel(tmp_path) -> None:
@@ -181,11 +215,20 @@ async def test_otp_owner_expiry_requires_a_fresh_login(tmp_path) -> None:
     assert client.auth.login.await_count == 2
 
 
-async def test_rejected_totp_is_single_attempt_and_keeps_owner(tmp_path) -> None:
+@pytest.mark.parametrize(
+    "api_error",
+    [
+        APIError(status_code=400),
+        AuthenticationError(status_code=401),
+        AuthenticationError(status_code=403),
+        APIError(status_code=422),
+    ],
+)
+async def test_rejected_totp_is_single_attempt_and_keeps_owner(tmp_path, api_error) -> None:
     client = fake_client(authenticated=False)
     client.auth.aload_session.side_effect = FileNotFoundError
     client.auth.login.side_effect = require_totp(client.auth)
-    client.auth.submit_totp.side_effect = AuthenticationError(status_code=401)
+    client.auth.submit_totp.side_effect = api_error
     gateway = ArvanCloudGateway(settings(tmp_path), client=client)
     await gateway.start()
     await gateway.begin_authentication(1)
@@ -197,6 +240,38 @@ async def test_rejected_totp_is_single_attempt_and_keeps_owner(tmp_path) -> None
     client.auth.submit_totp.assert_awaited_once()
     with pytest.raises(AuthenticationBusyError):
         await gateway.begin_authentication(2)
+
+
+async def test_422_totp_logs_only_safe_diagnostics_and_keeps_challenge(tmp_path, caplog) -> None:
+    caplog.set_level(logging.DEBUG, logger="arvancld_telegram.gateway")
+    client = fake_client(authenticated=False)
+    client.auth.aload_session.side_effect = FileNotFoundError
+    client.auth.login.side_effect = require_totp(client.auth)
+    client.auth.submit_totp.side_effect = APIError(
+        status_code=422,
+        request_id="request-422",
+        response_content_type="application/json",
+        response_size=321,
+        response_fields=("detail",),
+        validation_issues=(APIValidationIssue(("body", "challenge", "code"), "missing"),),
+    )
+    gateway = ArvanCloudGateway(settings(tmp_path), client=client)
+    await gateway.start()
+    await gateway.begin_authentication(1)
+
+    with pytest.raises(OTPRejectedError):
+        await gateway.submit_totp(1, "246810")
+
+    assert gateway.auth_state is AuthenticationState.OTP_REQUIRED
+    client.auth.submit_totp.assert_awaited_once_with("246810")
+    assert "status=422" in caplog.text
+    assert "request_id=request-422" in caplog.text
+    assert "content_type=application/json" in caplog.text
+    assert "body_size=321" in caplog.text
+    assert "('body', 'challenge', 'code')" in caplog.text
+    assert "missing" in caplog.text
+    assert "246810" not in caplog.text
+    assert "secret" not in caplog.text
 
 
 async def test_uncertain_totp_is_not_retried_and_forces_fresh_login(tmp_path) -> None:
@@ -214,6 +289,31 @@ async def test_uncertain_totp_is_not_retried_and_forces_fresh_login(tmp_path) ->
         await gateway.submit_totp(1, "246810")
 
     client.auth.submit_totp.assert_awaited_once()
+
+
+async def test_invalid_success_response_is_logged_without_body_and_forces_fresh_login(
+    tmp_path, caplog
+) -> None:
+    caplog.set_level(logging.INFO, logger="arvancld_telegram.gateway")
+    client = fake_client(authenticated=False)
+    client.auth.aload_session.side_effect = FileNotFoundError
+    client.auth.login.side_effect = require_totp(client.auth)
+    client.auth.submit_totp.side_effect = InvalidResponseError(
+        "response contained 246810 provider-message-do-not-log"
+    )
+    gateway = ArvanCloudGateway(settings(tmp_path), client=client)
+    await gateway.start()
+    await gateway.begin_authentication(1)
+
+    with pytest.raises(OTPSubmissionUncertainError):
+        await gateway.submit_totp(1, "246810")
+
+    client.auth.submit_totp.assert_awaited_once_with("246810")
+    assert "event=totp_sdk_submission_invalid_response" in caplog.text
+    assert "246810" not in caplog.text
+    assert "provider-message-do-not-log" not in caplog.text
+    with pytest.raises(OTPFlowExpiredError):
+        await gateway.submit_totp(1, "246810")
 
 
 async def test_authentication_failure_refreshes_and_retries_once(tmp_path) -> None:

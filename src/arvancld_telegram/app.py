@@ -3,9 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import importlib.metadata
 import logging
+import os
 from contextlib import suppress
 
+import arvancld
+from arvancld.auth import AsyncAuthService
 from dotenv import load_dotenv
 from telebot.async_telebot import AsyncTeleBot
 
@@ -16,12 +20,29 @@ from arvancld_telegram.gateway import ArvanCloudGateway
 logger = logging.getLogger(__name__)
 
 
+def log_sdk_provenance() -> None:
+    """Log only immutable, non-secret SDK build provenance and capability data."""
+
+    try:
+        version = importlib.metadata.version("arvancld")
+    except importlib.metadata.PackageNotFoundError:
+        version = getattr(arvancld, "__version__", "unavailable")
+    logger.info(
+        "arvancld sdk version=%s sha=%s module=%s submit_totp=%s",
+        version,
+        os.environ.get("ARVANCLD_SDK_REF", "unavailable"),
+        getattr(arvancld, "__file__", "unavailable"),
+        hasattr(AsyncAuthService, "submit_totp"),
+    )
+
+
 async def run(settings: Settings | None = None) -> None:
     """Validate dependencies, register handlers, and poll until shutdown."""
 
     load_dotenv()
     resolved = settings or Settings.from_env()
     configure_logging(resolved.log_level)
+    log_sdk_provenance()
 
     bot = AsyncTeleBot(resolved.telegram_bot_token, parse_mode="HTML")
     gateway = ArvanCloudGateway(resolved)
