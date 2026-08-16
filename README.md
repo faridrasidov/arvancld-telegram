@@ -71,7 +71,53 @@ The SDK dependency is pinned to the published and verified Git commit
 `19f8b49b993bbec935f7cd61bbb65ff9bcb1982f` for reproducible installs, typed TOTP support, and
 secret-safe API error diagnostics.
 
-## Run locally
+## Interactive authentication and recent features
+
+The bot supports ArvanCloud accounts protected by TOTP/2FA. The OTP is not entered in the
+terminal or Docker stdin. When a login requires TOTP, the bot enters a restricted `OTP required`
+state, starts Telegram polling, and asks an authorized administrator to run `/auth` in a private
+chat. The six-digit code is accepted once, deleted on a best-effort basis, and never stored or
+logged. After successful submission, the bot saves the authenticated session atomically and
+validates CDN access before enabling DNS operations.
+
+The authentication flow also provides:
+
+- A five-minute ownership lease so only one administrator can complete a challenge at a time.
+- `/auth` to claim or restart a challenge and `/cancel` to release an owned challenge.
+- Explicit handling for rejected OTPs, expired sessions, network-uncertain submissions, and
+  responses that do not match the SDK contract.
+- Correlated, secret-safe authentication diagnostics using an opaque attempt ID and challenge
+  revision. Passwords, OTP values, tokens, flow tokens, session contents, and raw provider bodies
+  are not logged.
+- One token refresh on a later `401` or `403`; failed refresh falls back to one password login.
+  Operations are not silently resumed after an interactive authentication challenge.
+
+If the container repeatedly restarts during login, stop it and wait for the provider rate limit to
+clear before trying again. A Docker restart loop can repeatedly submit password-login requests and
+lead to HTTP `429` responses. Inspect one attempt at a time with `docker compose logs bot` and share
+only the relevant safe diagnostic lines; never share `.env`, the session file, or raw provider
+responses.
+
+## Run locally on Linux/macOS
+
+Create and activate a virtual environment, then install the project and development dependencies:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -e ".[dev]"
+python -m arvancld_telegram
+```
+
+The installed console command is equivalent:
+
+```bash
+arvancld-telegram
+```
+
+## Run locally on Windows
+
+Install Python 3.10 or newer, open PowerShell in the repository directory, and run:
 
 ```powershell
 python -m venv .venv
@@ -100,7 +146,7 @@ If this fallback reaches TOTP, the active DNS operation stops and is never resum
 After authentication, repeat the read operation or rebuild and reconfirm the mutation. Login,
 refresh, OTP submission, and DNS mutations are otherwise not retried.
 
-## Run with Docker Compose
+## Run with Docker Compose on Linux/macOS
 
 Create the bind-mounted directory before first launch. On Linux, make it writable by container UID
 `10001`; Windows Docker Desktop normally manages this automatically.
@@ -112,6 +158,33 @@ docker compose build --no-cache --pull
 docker compose up -d
 docker compose logs -f bot
 ```
+
+## Run with Docker Compose on Windows
+
+Install Docker Desktop with the WSL 2 backend, clone the repository, and open PowerShell in the
+repository directory. Docker Desktop manages permissions for the bind mount in the usual case;
+you do not need to run `chown`.
+
+```powershell
+New-Item -ItemType Directory -Force data
+docker compose build --no-cache --pull
+docker compose up -d
+docker compose logs -f bot
+```
+
+If Docker Desktop cannot access the repository or the `data` directory, move the project under a
+path shared with Docker Desktop or enable file sharing for that drive. The session is stored in
+`data\arvancld-session.json` on the host and must be protected like a password file.
+
+On either platform, stop a failed startup loop before retrying authentication:
+
+```powershell
+docker compose down
+```
+
+After the ArvanCloud rate limit has cleared, start the service again and complete the login from
+Telegram with `/auth`. `docker compose up -d` is intentionally detached; the OTP prompt appears in
+Telegram, not in the PowerShell window.
 
 The multi-stage build clones the SDK repository at `ARVANCLD_GIT_REF`, verifies that
 `git rev-parse HEAD` exactly matches the 40-character SHA, builds wheels, and installs only those
