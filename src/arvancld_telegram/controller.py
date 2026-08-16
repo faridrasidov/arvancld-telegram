@@ -174,7 +174,8 @@ class BotController:
         if isinstance(exc, SessionError):
             await self.bot.send_message(
                 chat_id,
-                "ArvanCloud authentication succeeded, but the local session file could not be saved. "
+                "ArvanCloud authentication succeeded, but the local session file "
+                "could not be saved. "
                 "Check the Docker volume permissions (chown 10001:10001 data).",
             )
             return
