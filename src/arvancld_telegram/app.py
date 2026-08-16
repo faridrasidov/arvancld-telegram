@@ -51,7 +51,27 @@ async def run(settings: Settings | None = None) -> None:
     try:
         controller.register_handlers()
         await bot.get_me()
-        await gateway.start()
+
+        # Keep transient startup failures inside this process so Docker's restart
+        # policy cannot turn one provider error into a rapid password-login loop.
+        retry_delay = 10.0
+        while True:
+            try:
+                await gateway.start()
+                break
+            except (
+                arvancld.APIError,
+                arvancld.AuthenticationError,
+                arvancld.InvalidResponseError,
+                arvancld.NetworkError,
+            ) as exc:
+                logger.error(
+                    "ArvanCloud gateway startup failed: %s; retrying in %s seconds",
+                    exc,
+                    retry_delay,
+                )
+                await asyncio.sleep(retry_delay)
+
         await bot.skip_updates()
         logger.info("starting Telegram long polling")
         polling = asyncio.create_task(

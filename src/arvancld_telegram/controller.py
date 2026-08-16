@@ -8,7 +8,7 @@ import logging
 from collections.abc import Awaitable, Callable
 from typing import Any
 
-from arvancld import APIError, ArvanCloudError, DNSRecord, NetworkError
+from arvancld import APIError, ArvanCloudError, DNSRecord, NetworkError, SessionError
 from telebot import types
 from telebot.async_telebot import AsyncTeleBot
 
@@ -170,6 +170,13 @@ class BotController:
             return
         if isinstance(exc, (StaleRecordError, ProtectedRecordError)):
             await self.bot.send_message(chat_id, html.escape(str(exc)))
+            return
+        if isinstance(exc, SessionError):
+            await self.bot.send_message(
+                chat_id,
+                "ArvanCloud authentication succeeded, but the local session file could not be saved. "
+                "Check the Docker volume permissions (chown 10001:10001 data).",
+            )
             return
         if isinstance(exc, APIError):
             request = f", request ID {html.escape(exc.request_id)}" if exc.request_id else ""

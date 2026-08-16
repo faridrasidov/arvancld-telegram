@@ -6,6 +6,8 @@ import logging
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
+from arvancld import InvalidResponseError
+
 from arvancld_telegram import app
 from arvancld_telegram.config import Settings
 from arvancld_telegram.gateway import AuthenticationState
@@ -75,3 +77,52 @@ async def test_handlers_and_otp_notification_are_ready_before_polling(
         "close_gateway",
         "close_bot",
     ]
+
+
+async def test_start_backoff_on_initial_validation_failure(tmp_path, monkeypatch) -> None:
+    events: list[str] = []
+    bot = SimpleNamespace(
+        get_me=AsyncMock(),
+        skip_updates=AsyncMock(),
+        infinity_polling=AsyncMock(),
+        close_session=AsyncMock(),
+    )
+    gateway = SimpleNamespace(
+        start=AsyncMock(
+            side_effect=[InvalidResponseError("invalid format"), AuthenticationState.CONNECTED]
+        ),
+        close=AsyncMock(),
+    )
+
+    class FakeController:
+        def __init__(self, *_args) -> None:
+            pass
+
+        def register_handlers(self) -> None:
+            events.append("handlers")
+
+        async def notify_auth_required(self) -> None:
+            pass
+
+    sleep_calls = []
+
+    async def fake_sleep(duration):
+        sleep_calls.append(duration)
+
+    monkeypatch.setattr(app, "AsyncTeleBot", lambda *_args, **_kwargs: bot)
+    monkeypatch.setattr(app, "ArvanCloudGateway", lambda _settings: gateway)
+    monkeypatch.setattr(app, "BotController", FakeController)
+    monkeypatch.setattr(app.asyncio, "sleep", fake_sleep)
+
+    settings = Settings(
+        telegram_bot_token="123:test",
+        telegram_admin_ids=frozenset({1}),
+        arvancld_email="admin@example.test",
+        arvancld_password="secret",
+        arvancld_session_path=tmp_path / "session.json",
+    )
+
+    await app.run(settings)
+
+    # ensure sleep was called with exactly 10 seconds due to the error
+    assert 10.0 in sleep_calls
