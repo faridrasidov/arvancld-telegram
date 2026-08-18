@@ -1,0 +1,11 @@
+# Run faridrasidov/arvancld-telegram. Prepares ./data for container UID 10001.
+services:
+  bot:
+    image: faridrasidov/arvancld-telegram:latest
+    env_file:
+      - .env
+    environment:
+      ARVANCLD_SESSION_PATH: /app/data/arvancld-session.json
+    volumes:
+      - ./data:/app/data
+    restart: unless-stopped

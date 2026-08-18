@@ -27,6 +27,16 @@ def test_sdk_dependency_docker_and_compose_pins_match() -> None:
     assert python_pin == docker_pin == compose_pin
 
 
+def test_image_compose_prepares_data_and_does_not_build() -> None:
+    compose = (ROOT / "compose.image.yaml").read_text(encoding="utf-8")
+
+    assert "build:" not in compose
+    assert "faridrasidov/arvancld-telegram:" in compose
+    assert "mkdir -p /app/data && chown -R 10001:10001 /app/data" in compose
+    assert "service_completed_successfully" in compose
+    assert "./data:/app/data" in compose
+
+
 def test_docker_clones_verifies_and_checks_totp_capability() -> None:
     dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
 

@@ -8,6 +8,27 @@ The bot lists CDN domains and supports DNS record listing, exact-name search, ty
 creation, editing, cloud-proxy toggling, and deletion. Every DNS mutation has a single-use,
 five-minute confirmation screen.
 
+## Run the published Docker image
+
+Images are on Docker Hub as [`faridrasidov/arvancld-telegram`](https://hub.docker.com/r/faridrasidov/arvancld-telegram).
+
+`compose.image.yaml` pulls that image and prepares `./data` for container UID `10001` before the
+bot starts. You do not need to run `mkdir` or `chown`. Copy `.env.example` to `.env`, fill in
+real values, then:
+
+```bash
+docker compose -f compose.image.yaml up -d
+docker compose -f compose.image.yaml logs -f bot
+```
+
+Pin a release by changing both image tags from `latest` to the project version, for example
+`faridrasidov/arvancld-telegram:0.1.0`. The session is stored in `data/arvancld-session.json` on
+the host and must be protected like a password file.
+
+Stop a failed startup loop with `docker compose -f compose.image.yaml down`. After the ArvanCloud
+rate limit has cleared, start the service again and complete the login from Telegram with `/auth`.
+The OTP prompt appears in Telegram, not in the terminal.
+
 ## Security model
 
 - One ArvanCloud account is configured on the server; credentials are never entered in Telegram.
@@ -146,10 +167,11 @@ If this fallback reaches TOTP, the active DNS operation stops and is never resum
 After authentication, repeat the read operation or rebuild and reconfirm the mutation. Login,
 refresh, OTP submission, and DNS mutations are otherwise not retried.
 
-## Run with Docker Compose on Linux/macOS
+## Build with Docker Compose on Linux/macOS
 
-Create the bind-mounted directory before first launch. On Linux, make it writable by container UID
-`10001`; Windows Docker Desktop normally manages this automatically.
+`compose.yaml` builds from this repository. Create the bind-mounted directory before first launch.
+On Linux, make it writable by container UID `10001`; Windows Docker Desktop normally manages this
+automatically.
 
 ```bash
 mkdir -p data
@@ -159,7 +181,7 @@ docker compose up -d
 docker compose logs -f bot
 ```
 
-## Run with Docker Compose on Windows
+## Build with Docker Compose on Windows
 
 Install Docker Desktop with the WSL 2 backend, clone the repository, and open PowerShell in the
 repository directory. Docker Desktop manages permissions for the bind mount in the usual case;
@@ -180,6 +202,7 @@ On either platform, stop a failed startup loop before retrying authentication:
 
 ```powershell
 docker compose down
+docker compose -f compose.image.yaml down
 ```
 
 After the ArvanCloud rate limit has cleared, start the service again and complete the login from
