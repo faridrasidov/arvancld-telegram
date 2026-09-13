@@ -14,6 +14,10 @@ from arvancld import CDNDomain, DNSRecord, DNSRecordCreate, DNSRecordUpdate
 
 STATE_TTL_SECONDS = 15 * 60
 CONFIRMATION_TTL_SECONDS = 5 * 60
+MENU_SNAPSHOT_TTL_SECONDS = 24 * 60 * 60
+MAX_MENU_SNAPSHOTS_PER_USER = 32
+
+MenuView = Literal["domains", "records", "record", "filter", "confirmation"]
 
 
 def new_revision() -> str:
@@ -67,6 +71,23 @@ class Confirmation:
         return current >= self.expires_at
 
 
+@dataclass(frozen=True, slots=True)
+class MenuSnapshot:
+    """Bounded navigation context for callbacks rendered in earlier messages."""
+
+    revision: str
+    view: MenuView
+    created_at: float
+    domain_page: int = 1
+    domain_names: tuple[str, ...] = ()
+    selected_domain: str | None = None
+    record_page: int = 1
+    record_ids: tuple[str, ...] = ()
+    selected_record_id: str | None = None
+    search: str | None = None
+    record_type_filter: str | None = None
+
+
 @dataclass(slots=True)
 class UserState:
     revision: str = field(default_factory=new_revision)
@@ -99,13 +120,39 @@ class UserState:
         self.confirmation = None
         self.touch()
 
+    def restore_menu(self, snapshot: MenuSnapshot) -> None:
+        """Restore navigation only; wizard and confirmation state is never revived."""
+
+        self.revision = snapshot.revision
+        self.domain_page = snapshot.domain_page
+        self.domains = []
+        self.selected_domain = snapshot.selected_domain
+        self.record_page = snapshot.record_page
+        self.records = []
+        self.selected_record = None
+        self.search = snapshot.search
+        self.record_type_filter = snapshot.record_type_filter
+        self.flow = None
+        self.draft = None
+        self.confirmation = None
+        self.touch()
+
 
 class ConversationStore:
     """Store isolated user state and locks without persistent credentials."""
 
-    def __init__(self, *, ttl_seconds: float = STATE_TTL_SECONDS) -> None:
+    def __init__(
+        self,
+        *,
+        ttl_seconds: float = STATE_TTL_SECONDS,
+        menu_ttl_seconds: float = MENU_SNAPSHOT_TTL_SECONDS,
+        max_menu_snapshots: int = MAX_MENU_SNAPSHOTS_PER_USER,
+    ) -> None:
         self._ttl_seconds = ttl_seconds
+        self._menu_ttl_seconds = menu_ttl_seconds
+        self._max_menu_snapshots = max_menu_snapshots
         self._states: dict[int, UserState] = {}
+        self._menu_snapshots: defaultdict[int, dict[str, MenuSnapshot]] = defaultdict(dict)
         self._locks: defaultdict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
 
     def lock(self, user_id: int) -> asyncio.Lock:
@@ -125,3 +172,64 @@ class ConversationStore:
         state = UserState()
         self._states[user_id] = state
         return state
+
+    def remember_menu(
+        self,
+        user_id: int,
+        state: UserState,
+        *,
+        view: MenuView,
+        selected_record_id: str | None = None,
+        now: float | None = None,
+    ) -> MenuSnapshot:
+        current = time.monotonic() if now is None else now
+        snapshots = self._menu_snapshots[user_id]
+        self._prune_menus(snapshots, current)
+        record_id = selected_record_id
+        if record_id is None and state.selected_record is not None:
+            record_id = str(state.selected_record.id)
+        snapshot = MenuSnapshot(
+            revision=state.revision,
+            view=view,
+            created_at=current,
+            domain_page=state.domain_page,
+            domain_names=(
+                tuple(domain.domain for domain in state.domains) if view == "domains" else ()
+            ),
+            selected_domain=state.selected_domain,
+            record_page=state.record_page,
+            record_ids=(
+                tuple(str(record.id) for record in state.records) if view == "records" else ()
+            ),
+            selected_record_id=record_id,
+            search=state.search,
+            record_type_filter=state.record_type_filter,
+        )
+        snapshots.pop(snapshot.revision, None)
+        snapshots[snapshot.revision] = snapshot
+        while len(snapshots) > self._max_menu_snapshots:
+            del snapshots[next(iter(snapshots))]
+        return snapshot
+
+    def get_menu(
+        self,
+        user_id: int,
+        revision: str,
+        *,
+        now: float | None = None,
+    ) -> MenuSnapshot | None:
+        current = time.monotonic() if now is None else now
+        snapshots = self._menu_snapshots.get(user_id)
+        if snapshots is None:
+            return None
+        self._prune_menus(snapshots, current)
+        return snapshots.get(revision)
+
+    def _prune_menus(self, snapshots: dict[str, MenuSnapshot], now: float) -> None:
+        expired = [
+            revision
+            for revision, snapshot in snapshots.items()
+            if now - snapshot.created_at >= self._menu_ttl_seconds
+        ]
+        for revision in expired:
+            del snapshots[revision]

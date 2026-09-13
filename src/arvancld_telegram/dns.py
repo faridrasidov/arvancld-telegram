@@ -23,6 +23,12 @@ class DNSInputError(ValueError):
     """Raised when a guided DNS value is invalid."""
 
 
+def format_cloud_status(enabled: bool) -> str:
+    """Return the consistent user-facing ArvanCloud proxy status."""
+
+    return "☁️ proxied" if enabled else "DNS only"
+
+
 def validate_record_type(value: str) -> str:
     record_type = value.strip().upper()
     if record_type not in RECORD_TYPES:
@@ -286,7 +292,7 @@ def changed_fields(before: DNSRecord, after: DNSRecordUpdate) -> Iterable[str]:
         ("Name", before.name, after.name),
         ("Value", format_record_value(before.value), format_record_value(after.value)),
         ("TTL", str(before.ttl), str(after.ttl)),
-        ("Cloud", "on" if before.cloud else "off", "on" if after.cloud else "off"),
+        ("Cloud", format_cloud_status(before.cloud), format_cloud_status(after.cloud)),
     )
     for label, old, new in comparisons:
         if old != new:

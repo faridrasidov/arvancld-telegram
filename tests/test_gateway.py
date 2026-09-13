@@ -337,6 +337,35 @@ async def test_authentication_failure_refreshes_and_retries_once(tmp_path) -> No
     assert client.cdn.domains.list.await_count == 2
 
 
+async def test_recovered_record_lookup_uses_existing_auth_refresh(
+    tmp_path, dns_record_factory
+) -> None:
+    client = fake_client()
+    record = dns_record_factory()
+    response = SimpleNamespace(
+        data=[record],
+        meta=SimpleNamespace(last_page=1, total=1),
+    )
+    client.cdn.dns_records.list.side_effect = [
+        AuthenticationError(status_code=401),
+        response,
+    ]
+    old_tokens = client.auth.tokens
+
+    async def refresh() -> None:
+        client.auth.tokens = object()
+
+    client.auth.refresh.side_effect = refresh
+    gateway = ArvanCloudGateway(settings(tmp_path), client=client)
+
+    result = await gateway.find_record("example.test", str(record.id))
+
+    assert result is record
+    assert client.auth.tokens is not old_tokens
+    client.auth.refresh.assert_awaited_once()
+    assert client.cdn.dns_records.list.await_count == 2
+
+
 async def test_rejected_refresh_logs_in_once_then_retries(tmp_path) -> None:
     client = fake_client()
     response = page()

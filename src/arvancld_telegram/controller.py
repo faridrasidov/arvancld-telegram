@@ -19,6 +19,7 @@ from arvancld_telegram.dns import (
     DNSInputError,
     changed_fields,
     create_record,
+    format_cloud_status,
     format_record_value,
     merge_record_value,
     parse_record_value,
@@ -42,6 +43,7 @@ from arvancld_telegram.state import (
     Confirmation,
     ConversationStore,
     Draft,
+    MenuSnapshot,
     UserState,
     callback_data,
     parse_callback,
@@ -49,6 +51,14 @@ from arvancld_telegram.state import (
 
 logger = logging.getLogger(__name__)
 PAGE_SIZE = 8
+SNAPSHOT_ACTIONS = {
+    "domains": frozenset({"dp", "ds"}),
+    "records": frozenset({"rp", "rs", "rr", "bd", "se", "sx", "fm", "cr"}),
+    "record": frozenset({"en", "ev", "el", "et", "cl", "de", "br"}),
+    "filter": frozenset({"fv"}),
+    "confirmation": frozenset({"ok", "no"}),
+}
+RECORD_ACTIONS = frozenset({"en", "ev", "el", "et", "cl", "de"})
 
 
 class BotController:
@@ -462,10 +472,30 @@ class BotController:
             state = self.store.get(user_id)
             try:
                 action, revision, argument = parse_callback(call.data)
+                snapshot = self.store.get_menu(user_id, revision)
                 if revision != state.revision:
-                    await self.bot.send_message(chat_id, "That menu expired. Open /domains again.")
+                    if snapshot is None or action not in SNAPSHOT_ACTIONS[snapshot.view]:
+                        await self._show_domains(
+                            chat_id, state, page=1, message_id=message.message_id
+                        )
+                        return
+                    state.restore_menu(snapshot)
+                    if snapshot.view == "confirmation":
+                        await self.bot.send_message(chat_id, "That confirmation expired.")
+                        await self._refresh_snapshot_target(
+                            chat_id, state, snapshot, message_id=message.message_id
+                        )
+                        return
+                    await self._dispatch_callback(
+                        call,
+                        state,
+                        action,
+                        argument,
+                        snapshot=snapshot,
+                        recovered=True,
+                    )
                     return
-                await self._dispatch_callback(call, state, action, argument)
+                await self._dispatch_callback(call, state, action, argument, snapshot=snapshot)
             except InteractiveAuthenticationRequired:
                 await self._request_authentication(chat_id, user_id, state)
             except Exception as exc:  # handlers must never terminate polling
@@ -477,9 +507,23 @@ class BotController:
         state: UserState,
         action: str,
         argument: str | None,
+        *,
+        snapshot: MenuSnapshot | None = None,
+        recovered: bool = False,
     ) -> None:
         chat_id = call.message.chat.id
         message_id = call.message.message_id
+        if recovered and action in RECORD_ACTIONS:
+            if snapshot is None or snapshot.selected_record_id is None:
+                await self._show_records(
+                    chat_id, state, page=state.record_page, message_id=message_id
+                )
+                return
+            record = await self._load_recovered_record(
+                chat_id, state, snapshot.selected_record_id, message_id=message_id
+            )
+            if record is None:
+                return
 
         if action == "dp":
             await self._show_domains(
@@ -487,9 +531,17 @@ class BotController:
             )
         elif action == "ds":
             index = self._integer_argument(argument)
-            if index < 0 or index >= len(state.domains):
+            domain_names = snapshot.domain_names if recovered and snapshot else ()
+            if recovered:
+                if index < 0 or index >= len(domain_names):
+                    await self._show_domains(chat_id, state, page=1, message_id=message_id)
+                    return
+                selected_domain = domain_names[index]
+            elif index < 0 or index >= len(state.domains):
                 raise ValueError("Stale domain selection")
-            state.selected_domain = state.domains[index].domain
+            else:
+                selected_domain = state.domains[index].domain
+            state.selected_domain = selected_domain
             state.search = None
             state.record_type_filter = None
             await self._show_records(chat_id, state, page=1, message_id=message_id)
@@ -499,12 +551,24 @@ class BotController:
             )
         elif action == "rs":
             index = self._integer_argument(argument)
-            if index < 0 or index >= len(state.records):
+            record_ids = snapshot.record_ids if recovered and snapshot else ()
+            if recovered:
+                if index < 0 or index >= len(record_ids):
+                    await self._show_records(
+                        chat_id, state, page=state.record_page, message_id=message_id
+                    )
+                    return
+                record = await self._load_recovered_record(
+                    chat_id, state, record_ids[index], message_id=message_id
+                )
+                if record is None:
+                    return
+            elif index < 0 or index >= len(state.records):
                 raise ValueError("Stale record selection")
-            state.selected_record = state.records[index]
-            await self._show_record_detail(
-                chat_id, state, state.records[index], message_id=message_id
-            )
+            else:
+                record = state.records[index]
+            state.selected_record = record
+            await self._show_record_detail(chat_id, state, record, message_id=message_id)
         elif action == "rr":
             await self._show_records(chat_id, state, page=state.record_page, message_id=message_id)
         elif action == "bd":
@@ -573,6 +637,54 @@ class BotController:
             return int(argument or "")
         except ValueError:
             raise ValueError("Invalid callback argument") from None
+
+    async def _load_recovered_record(
+        self,
+        chat_id: int,
+        state: UserState,
+        record_id: str,
+        *,
+        message_id: int,
+    ) -> DNSRecord | None:
+        domain = state.selected_domain
+        if domain is None:
+            await self._show_domains(chat_id, state, page=1, message_id=message_id)
+            return None
+        record = await self.gateway.find_record(domain, record_id)
+        if record is not None:
+            state.selected_record = record
+            return record
+        state.selected_record = None
+        await self.bot.send_message(
+            chat_id, "That DNS record no longer exists. Showing current records."
+        )
+        await self._show_records(chat_id, state, page=state.record_page, message_id=message_id)
+        return None
+
+    async def _refresh_snapshot_target(
+        self,
+        chat_id: int,
+        state: UserState,
+        snapshot: MenuSnapshot,
+        *,
+        message_id: int,
+    ) -> None:
+        if snapshot.selected_domain is None:
+            await self._show_domains(
+                chat_id, state, page=snapshot.domain_page, message_id=message_id
+            )
+            return
+        if snapshot.selected_record_id is not None:
+            record = await self._load_recovered_record(
+                chat_id,
+                state,
+                snapshot.selected_record_id,
+                message_id=message_id,
+            )
+            if record is not None:
+                await self._show_record_detail(chat_id, state, record, message_id=message_id)
+            return
+        await self._show_records(chat_id, state, page=snapshot.record_page, message_id=message_id)
 
     async def _display(
         self,
@@ -645,6 +757,7 @@ class BotController:
         )
         if not result.data:
             text += "\n\nNo domains were returned for this account."
+        self.store.remember_menu(chat_id, state, view="domains")
         await self._display(chat_id, text, self._markup(rows), message_id)
 
     async def _show_records(
@@ -674,7 +787,14 @@ class BotController:
         state.rotate_revision()
         rows = []
         for index, record in enumerate(result.data):
-            marker = "🔒 " if record.is_protected else ""
+            markers = []
+            if record.is_protected:
+                markers.append("🔒")
+            if record.cloud:
+                markers.append("☁️")
+            marker = " ".join(markers)
+            if marker:
+                marker += " "
             compact_value = format_record_value(record.value, compact=True)
             label = f"{marker}{record.type.upper()} {record.name} — {compact_value}"
             rows.append([self._button(label[:64], "rs", state, index)])
@@ -713,6 +833,7 @@ class BotController:
             text += "\nFilter: " + ", ".join(filters)
         if not result.data:
             text += "\n\nNo records match this view."
+        self.store.remember_menu(chat_id, state, view="records")
         await self._display(chat_id, text, self._markup(rows), message_id)
 
     async def _show_filter_menu(self, chat_id: int, state: UserState, message_id: int) -> None:
@@ -725,6 +846,7 @@ class BotController:
             for start in range(0, len(RECORD_TYPES), 3)
         ]
         rows.append([self._button("Any type", "fv", state, -1)])
+        self.store.remember_menu(chat_id, state, view="filter")
         await self._display(chat_id, "<b>Filter by record type</b>", self._markup(rows), message_id)
 
     async def _show_record_detail(
@@ -742,7 +864,7 @@ class BotController:
             f"<b>{html.escape(record.type.upper())} {html.escape(record.name)}</b>\n"
             f"Value: <code>{html.escape(format_record_value(record.value))}</code>\n"
             f"TTL: {record.ttl}\n"
-            f"Cloud: {'on' if record.cloud else 'off'}\n"
+            f"Cloud: {format_cloud_status(record.cloud)}\n"
             f"Protected: {'yes' if record.is_protected else 'no'}\n"
             f"Updated: {html.escape(record.updated_at.isoformat())}\n"
             f"ID: <code>{record.id}</code>"
@@ -760,12 +882,17 @@ class BotController:
                         self._button("Edit TTL", "el", state),
                     ],
                     [
-                        self._button("Toggle cloud", "cl", state),
+                        self._button(
+                            "☁️ Disable proxy" if record.cloud else "☁️ Enable proxy",
+                            "cl",
+                            state,
+                        ),
                         self._button("Delete", "de", state),
                     ],
                 ]
             )
         rows.append([self._button("Back to records", "br", state)])
+        self.store.remember_menu(chat_id, state, view="record")
         await self._display(chat_id, text, self._markup(rows), message_id)
 
     async def _prompt(
@@ -817,8 +944,8 @@ class BotController:
         markup = self._markup(
             [
                 [
-                    self._button("Cloud off", "cc", state, 0),
-                    self._button("Cloud on", "cc", state, 1),
+                    self._button("DNS only", "cc", state, 0),
+                    self._button("☁️ Proxied", "cc", state, 1),
                 ],
                 [self._button("Cancel", "no", state)],
             ]
@@ -852,7 +979,7 @@ class BotController:
             f"Type: {html.escape(payload.type)}\n"
             f"Name: {html.escape(payload.name)}\n"
             f"Value: <code>{html.escape(format_record_value(payload.value))}</code>\n"
-            f"TTL: {payload.ttl}\nCloud: {'on' if payload.cloud else 'off'}"
+            f"TTL: {payload.ttl}\nCloud: {format_cloud_status(payload.cloud)}"
         )
         await self._show_confirmation(chat_id, state, confirmation, summary, message_id)
 
@@ -938,7 +1065,8 @@ class BotController:
             chat_id,
             state,
             confirmation,
-            f"<b>Confirm DNS record update</b>\n<code>{rendered}</code>",
+            f"<b>Confirm DNS record update</b>\n<code>{rendered}</code>\n"
+            f"Cloud: {format_cloud_status(payload.cloud)}",
         )
 
     async def _prepare_cloud_confirmation(
@@ -960,7 +1088,8 @@ class BotController:
             state,
             confirmation,
             f"<b>Confirm cloud status change</b>\n{html.escape(record.type.upper())} "
-            f"{html.escape(record.name)}: {'off → on' if enabled else 'on → off'}",
+            f"{html.escape(record.name)}\nCloud: {format_cloud_status(record.cloud)} → "
+            f"{format_cloud_status(enabled)}",
             message_id,
         )
 
@@ -982,7 +1111,8 @@ class BotController:
             confirmation,
             "<b>Confirm permanent DNS record deletion</b>\n"
             f"{html.escape(record.type.upper())} {html.escape(record.name)}\n"
-            f"<code>{html.escape(format_record_value(record.value))}</code>",
+            f"<code>{html.escape(format_record_value(record.value))}</code>\n"
+            f"Cloud: {format_cloud_status(record.cloud)}",
             message_id,
         )
 
@@ -1005,6 +1135,12 @@ class BotController:
                 ]
             ]
         )
+        self.store.remember_menu(
+            chat_id,
+            state,
+            view="confirmation",
+            selected_record_id=confirmation.record_id,
+        )
         await self._display(chat_id, summary, markup, message_id)
 
     async def _execute_confirmation(self, call: Any, state: UserState, token: str | None) -> None:
@@ -1012,6 +1148,15 @@ class BotController:
         if confirmation is None or token != confirmation.token or confirmation.is_expired():
             state.confirmation = None
             await self.bot.send_message(call.message.chat.id, "That confirmation expired.")
+            snapshot = self.store.get_menu(call.from_user.id, state.revision)
+            if snapshot is not None and snapshot.view == "confirmation":
+                state.restore_menu(snapshot)
+                await self._refresh_snapshot_target(
+                    call.message.chat.id,
+                    state,
+                    snapshot,
+                    message_id=call.message.message_id,
+                )
             return
 
         state.confirmation = None  # make every confirmation single-use before network I/O

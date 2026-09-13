@@ -237,8 +237,13 @@ The startup log reports the installed package version, exact SHA, module locatio
 
 Domain and record pages contain eight items and provide previous/next navigation, refresh,
 exact-name search, record-type filtering, and back actions. Protected provider records are visible
-but read-only. Before updating, toggling, or deleting, the bot reloads the record and refuses the
-change if its `updated_at` value no longer matches the selected snapshot.
+but read-only. Proxied records are marked with `☁️`; records without that icon are DNS only.
+Domain, record-list, record-detail, and filter menus remain usable for up to 24 hours, with the
+newest 32 views retained separately for each administrator. The bot reloads current provider data
+when an older menu is used. If a menu is no longer recoverable or the bot restarted, its message
+is replaced with a fresh domain menu automatically. Mutation confirmations are never restored and
+still expire after five minutes. Before updating, toggling, or deleting, the bot reloads the
+record and refuses the change if its `updated_at` value no longer matches the selected snapshot.
 
 When authentication is incomplete, `/status` reports `OTP required`, `authenticating`, or
 `unavailable` without attempting a CDN request. `/cancel` releases an owned OTP prompt; the next

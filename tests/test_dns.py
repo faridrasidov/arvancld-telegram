@@ -6,7 +6,9 @@ import pytest
 
 from arvancld_telegram.dns import (
     DNSInputError,
+    changed_fields,
     create_record,
+    format_cloud_status,
     format_record_value,
     merge_record_value,
     parse_record_value,
@@ -135,3 +137,12 @@ def test_create_and_update_keep_provider_defaults(dns_record_factory) -> None:
 def test_format_value_handles_lists_and_dicts() -> None:
     assert format_record_value([{"ip": "192.0.2.1", "port": None}]) == "ip=192.0.2.1"
     assert format_record_value({"text": "hello"}) == "text=hello"
+
+
+def test_cloud_status_and_change_summary_use_proxy_labels(dns_record_factory) -> None:
+    original = dns_record_factory(cloud=False)
+    updated = update_record(original, cloud=True)
+
+    assert format_cloud_status(False) == "DNS only"
+    assert format_cloud_status(True) == "☁️ proxied"
+    assert "Cloud: DNS only → ☁️ proxied" in changed_fields(original, updated)
