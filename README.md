@@ -22,7 +22,7 @@ docker compose -f compose.image.yaml logs -f bot
 ```
 
 Pin a release by changing both image tags from `latest` to the project version, for example
-`faridrasidov/arvancld-telegram:0.1.0`. The session is stored in `data/arvancld-session.json` on
+`faridrasidov/arvancld-telegram:0.2.0`. The session is stored in `data/arvancld-session.json` on
 the host and must be protected like a password file.
 
 Stop a failed startup loop with `docker compose -f compose.image.yaml down`. After the ArvanCloud
