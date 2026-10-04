@@ -272,6 +272,46 @@ async def test_old_record_refresh_restores_page_search_and_filter() -> None:
     }
 
 
+async def test_filter_menu_back_keeps_current_filter() -> None:
+    bot = FakeBot()
+    gateway = FakeGateway()
+    controller = BotController(bot, settings(), gateway)  # type: ignore[arg-type]
+    state = controller.store.get(1)
+    state.selected_domain = "example.test"
+    state.record_type_filter = "MX"
+    gateway.list_records.return_value = page([], current_page=2, last_page=2)
+    await controller._show_records(1, state, page=2)
+
+    await controller.handle_callback(callback(button_data(bot.sent[-1][2], "Filter")))
+    await controller.handle_callback(callback(button_data(bot.edited[-1][3], "Back to records")))
+
+    assert "DNS records" in bot.edited[-1][2]
+    assert gateway.list_records.await_args.kwargs == {
+        "page": 2,
+        "per_page": 8,
+        "record_type": "MX",
+        "search": None,
+    }
+
+
+async def test_old_filter_menu_back_returns_to_its_records() -> None:
+    bot = FakeBot()
+    gateway = FakeGateway()
+    controller = BotController(bot, settings(), gateway)  # type: ignore[arg-type]
+    state = controller.store.get(1)
+    state.selected_domain = "example.test"
+    gateway.list_records.return_value = page([])
+    await controller._show_records(1, state, page=1)
+    await controller.handle_callback(callback(button_data(bot.sent[-1][2], "Filter")))
+    old_back = button_data(bot.edited[-1][3], "Back to records")
+
+    await controller._show_records(1, state, page=1)
+    await controller.handle_callback(callback(old_back))
+
+    gateway.list_domains.assert_not_awaited()
+    assert gateway.list_records.await_args.args[0] == "example.test"
+
+
 async def test_old_record_menu_uses_stable_id_and_reloads_current_data(
     dns_record_factory,
 ) -> None:
