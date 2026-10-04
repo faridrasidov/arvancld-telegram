@@ -41,6 +41,7 @@ async def test_handlers_and_otp_notification_are_ready_before_polling(
                 AuthenticationState.OTP_REQUIRED,
             )[1]
         ),
+        keep_session_fresh=AsyncMock(side_effect=lambda: events.append("refresher")),
         close=AsyncMock(side_effect=lambda: events.append("close_gateway")),
     )
 
@@ -72,6 +73,7 @@ async def test_handlers_and_otp_notification_are_ready_before_polling(
         "telegram",
         "gateway",
         "skip",
+        "refresher",
         "poll",
         "notify",
         "close_gateway",
@@ -91,6 +93,7 @@ async def test_start_backoff_on_initial_validation_failure(tmp_path, monkeypatch
         start=AsyncMock(
             side_effect=[InvalidResponseError("invalid format"), AuthenticationState.CONNECTED]
         ),
+        keep_session_fresh=AsyncMock(),
         close=AsyncMock(),
     )
 

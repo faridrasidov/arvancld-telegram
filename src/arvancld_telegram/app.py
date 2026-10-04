@@ -48,6 +48,7 @@ async def run(settings: Settings | None = None) -> None:
     gateway = ArvanCloudGateway(resolved)
     controller = BotController(bot, resolved, gateway)
     polling: asyncio.Task[None] | None = None
+    session_refresher: asyncio.Task[None] | None = None
     try:
         controller.register_handlers()
         await bot.get_me()
@@ -72,6 +73,7 @@ async def run(settings: Settings | None = None) -> None:
                 )
                 await asyncio.sleep(retry_delay)
 
+        session_refresher = asyncio.create_task(gateway.keep_session_fresh())
         await bot.skip_updates()
         logger.info("starting Telegram long polling")
         polling = asyncio.create_task(
@@ -86,10 +88,11 @@ async def run(settings: Settings | None = None) -> None:
         await controller.notify_auth_required()
         await polling
     finally:
-        if polling is not None and not polling.done():
-            polling.cancel()
-            with suppress(asyncio.CancelledError):
-                await polling
+        for task in (polling, session_refresher):
+            if task is not None and not task.done():
+                task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await task
         await gateway.close()
         close_session = getattr(bot, "close_session", None)
         if close_session is not None:

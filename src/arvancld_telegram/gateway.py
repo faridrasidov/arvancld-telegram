@@ -7,6 +7,7 @@ import logging
 import secrets
 import time
 from collections.abc import Awaitable, Callable
+from datetime import UTC, datetime, timedelta
 from enum import Enum
 from pathlib import Path
 from typing import TypeVar
@@ -26,6 +27,7 @@ from arvancld import (
     SessionExpiredError,
     TOTPRequiredError,
 )
+from arvancld.auth.session import StoredSession
 from arvancld.cdn.models import CDNDomainPage
 
 from arvancld_telegram.config import Settings
@@ -33,6 +35,11 @@ from arvancld_telegram.config import Settings
 logger = logging.getLogger(__name__)
 ResultT = TypeVar("ResultT")
 OTP_OWNER_TTL_SECONDS = 5 * 60
+# Rotate access tokens this long before they expire so the saved session stays usable.
+TOKEN_REFRESH_MARGIN = timedelta(minutes=30)
+# Re-check expiry at least this often; wall-clock time can jump while the host sleeps.
+TOKEN_REFRESH_MAX_SLEEP_SECONDS = 10 * 60
+TOKEN_REFRESH_RETRY_SECONDS = 5 * 60
 
 
 class AuthenticationState(str, Enum):
@@ -138,12 +145,16 @@ class ArvanCloudGateway:
             try:
                 await self._client.auth.aload_session(self._session_path)
                 logger.info("loaded ArvanCloud session path=%s", self._session_path)
-            except (FileNotFoundError, InvalidSessionError, SessionExpiredError):
-                try:
-                    await self._login_and_save()
-                except TOTPRequiredError:
-                    self._set_totp_required()
-                    return self._auth_state
+            except (FileNotFoundError, InvalidSessionError, SessionExpiredError) as exc:
+                refreshed = isinstance(exc, SessionExpiredError) and (
+                    await self._refresh_expired_session()
+                )
+                if not refreshed:
+                    try:
+                        await self._login_and_save()
+                    except TOTPRequiredError:
+                        self._set_totp_required()
+                        return self._auth_state
 
             try:
                 self._log_validation_started()
@@ -163,6 +174,34 @@ class ArvanCloudGateway:
 
     async def close(self) -> None:
         await self._client.close()
+
+    async def keep_session_fresh(self) -> None:
+        """Rotate tokens before they expire so restarts and idle periods keep the session."""
+
+        while True:
+            delay = self._seconds_until_refresh()
+            await asyncio.sleep(
+                TOKEN_REFRESH_MAX_SLEEP_SECONDS
+                if delay is None
+                else min(delay, TOKEN_REFRESH_MAX_SLEEP_SECONDS)
+            )
+            try:
+                async with self._auth_lock:
+                    delay = self._seconds_until_refresh()
+                    if delay is None or delay > 0:
+                        continue
+                    self._auth_attempt_id = secrets.token_hex(6)
+                    await self._refresh_and_save()
+            except Exception as exc:  # the refresher must outlive transient failures
+                logger.warning(
+                    "auth event=token_refresh_failed attempt_id=%s error_type=%s status=%s "
+                    "retry_seconds=%s",
+                    self._attempt_id(),
+                    type(exc).__name__,
+                    getattr(exc, "status_code", "unavailable"),
+                    TOKEN_REFRESH_RETRY_SECONDS,
+                )
+                await asyncio.sleep(TOKEN_REFRESH_RETRY_SECONDS)
 
     async def begin_authentication(self, actor_id: int) -> AuthenticationState:
         """Claim an existing challenge or initiate a fresh account login."""
@@ -331,6 +370,63 @@ class ArvanCloudGateway:
         )
         await self._save_session()
 
+    async def _refresh_and_save(self) -> None:
+        logger.info("auth event=token_refresh_started attempt_id=%s", self._attempt_id())
+        await self._client.auth.refresh()
+        logger.info("auth event=token_refreshed attempt_id=%s", self._attempt_id())
+        await self._save_session()
+
+    async def _refresh_expired_session(self) -> bool:
+        """Use the saved refresh token when only the saved access token has expired."""
+
+        self._auth_attempt_id = secrets.token_hex(6)
+        if not await self._load_expired_tokens():
+            return False
+        try:
+            await self._refresh_and_save()
+        except APIError as exc:
+            if not _is_refresh_rejection(exc):
+                raise
+            self._client.auth._tokens = None
+            logger.info(
+                "auth event=token_refresh_rejected attempt_id=%s status=%s request_id=%s",
+                self._attempt_id(),
+                exc.status_code,
+                exc.request_id or "unavailable",
+            )
+            return False
+        return True
+
+    async def _load_expired_tokens(self) -> bool:
+        # The SDK refuses to load a session whose access token expired, although its
+        # refresh token is still valid. Read the same versioned file and hand the
+        # tokens to the SDK so refresh() can rotate them without a password login.
+        auth = self._client.auth
+        if not hasattr(auth, "_tokens"):
+            logger.warning(
+                "auth event=expired_session_unsupported attempt_id=%s", self._attempt_id()
+            )
+            return False
+        try:
+            content = await asyncio.to_thread(self._session_path.read_text, encoding="utf-8")
+            stored = StoredSession.model_validate_json(content)
+        except (OSError, ValueError):
+            return False
+        auth._tokens = stored.data
+        logger.info(
+            "auth event=expired_session_loaded attempt_id=%s path=%s",
+            self._attempt_id(),
+            self._session_path,
+        )
+        return True
+
+    def _seconds_until_refresh(self) -> float | None:
+        expires_at = getattr(self._client.auth.tokens, "expires_at", None)
+        if not self.connected or not isinstance(expires_at, datetime):
+            return None
+        due_at = expires_at - TOKEN_REFRESH_MARGIN
+        return max(0.0, (due_at - datetime.now(UTC)).total_seconds())
+
     async def _save_session(self) -> None:
         logger.info(
             "auth event=session_save_started attempt_id=%s challenge_revision=%s",
@@ -495,11 +591,11 @@ class ArvanCloudGateway:
             try:
                 try:
                     self._auth_state = AuthenticationState.AUTHENTICATING
-                    await self._client.auth.refresh()
-                    await self._save_session()
+                    await self._refresh_and_save()
                     self._mark_connected()
-                    logger.info("refreshed ArvanCloud session")
-                except AuthenticationError:
+                except APIError as exc:
+                    if not _is_refresh_rejection(exc):
+                        raise
                     logger.info("ArvanCloud refresh rejected; logging in once")
                     try:
                         await self._login_and_save()
@@ -594,3 +690,9 @@ class ArvanCloudGateway:
 
     async def delete_record(self, domain: str, record_id: str) -> DNSRecordDeleteResult:
         return await self._call(lambda: self._client.cdn.dns_records.delete(domain, record_id))
+
+
+def _is_refresh_rejection(exc: APIError) -> bool:
+    """Whether ArvanCloud refused the refresh token, as opposed to a transient failure."""
+
+    return isinstance(exc, AuthenticationError) or exc.status_code in {400, 422}
