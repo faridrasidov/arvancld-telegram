@@ -110,6 +110,8 @@ The authentication flow also provides:
 - Correlated, secret-safe authentication diagnostics using an opaque attempt ID and challenge
   revision. Passwords, OTP values, tokens, flow tokens, session contents, and raw provider bodies
   are not logged.
+- Background token refresh 30 minutes before the 12-hour access token expires, so restarts and
+  idle periods reuse the saved session instead of asking for a new OTP.
 - One token refresh on a later `401` or `403`; failed refresh falls back to one password login.
   Operations are not silently resumed after an interactive authentication challenge.
 
@@ -156,16 +158,22 @@ The installed console command is equivalent:
 .\.venv\Scripts\arvancld-telegram.exe
 ```
 
-On startup the bot loads its saved session. Missing, invalid, or expired sessions trigger one
-account login and an atomic session save. If that login requires TOTP, the bot starts polling in a
-restricted `OTP required` state and best-effort notifies the configured administrator chat IDs.
-Telegram may reject a notification until that user has opened the bot at least once; `/auth` is
-always the fallback.
+On startup the bot loads its saved session. If only the saved access token has expired, the bot
+first rotates it with the saved refresh token. Missing or invalid sessions, or a rejected refresh,
+trigger one account login and an atomic session save. If that login requires TOTP, the bot starts
+polling in a restricted `OTP required` state and best-effort notifies the configured administrator
+chat IDs. Telegram may reject a notification until that user has opened the bot at least once;
+`/auth` is always the fallback.
 
 A later `401` or `403` triggers one token refresh; a rejected refresh triggers one password login.
 If this fallback reaches TOTP, the active DNS operation stops and is never resumed automatically.
 After authentication, repeat the read operation or rebuild and reconfirm the mutation. Login,
 refresh, OTP submission, and DNS mutations are otherwise not retried.
+
+While connected, the bot rotates its tokens 30 minutes before the access token expires and saves
+the session again, retrying every five minutes after a failure. A background refresh never starts a
+password login. ArvanCloud refresh tokens are single-use, so run one bot instance per session file
+and never copy a session file to a second running instance.
 
 ## Build with Docker Compose on Linux/macOS
 
@@ -274,6 +282,11 @@ event=session_saved attempt_id=... challenge_revision=...
 event=cdn_validation_started attempt_id=... challenge_revision=...
 event=cdn_validation_completed attempt_id=... challenge_revision=...
 ```
+
+Session refreshes log `token_refresh_started`, `token_refreshed`, and the session save events. A
+startup refresh of an expired session first logs `expired_session_loaded`; a refused refresh logs
+`token_refresh_rejected` with HTTP status and request ID before the password-login fallback. A
+failed background refresh logs `token_refresh_failed` with the error type and status.
 
 An API rejection logs `totp_sdk_submission_rejected` with HTTP status, request ID, and elapsed
 time. At DEBUG it adds only content type, body byte count, top-level field names, and validation
