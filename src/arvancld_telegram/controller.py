@@ -20,6 +20,8 @@ from arvancld_telegram.dns import (
     changed_fields,
     create_record,
     format_cloud_status,
+    format_record_fqdn,
+    format_record_target,
     format_record_value,
     merge_record_value,
     parse_record_value,
@@ -795,9 +797,10 @@ class BotController:
             marker = " ".join(markers)
             if marker:
                 marker += " "
-            compact_value = format_record_value(record.value, compact=True)
-            label = f"{marker}{record.type.upper()} {record.name} — {compact_value}"
-            rows.append([self._button(label[:64], "rs", state, index)])
+            name = _shorten(format_record_fqdn(record.name, domain), 26)
+            target = _shorten(format_record_target(record.value), 22)
+            label = f"{marker}{record.type.upper()} | {name} ➜ {target}"
+            rows.append([self._button(label, "rs", state, index)])
         navigation: list[types.InlineKeyboardButton] = []
         if state.record_page > 1:
             navigation.append(self._button("< Previous", "rp", state, state.record_page - 1))
@@ -1246,3 +1249,7 @@ class BotController:
             state.selected_record = result
             await self.bot.send_message(chat_id, "DNS change applied successfully.")
             await self._show_record_detail(chat_id, state, result)
+
+
+def _shorten(text: str, limit: int) -> str:
+    return text if len(text) <= limit else f"{text[: limit - 1]}…"

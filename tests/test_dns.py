@@ -9,6 +9,8 @@ from arvancld_telegram.dns import (
     changed_fields,
     create_record,
     format_cloud_status,
+    format_record_fqdn,
+    format_record_target,
     format_record_value,
     merge_record_value,
     parse_record_value,
@@ -146,3 +148,39 @@ def test_cloud_status_and_change_summary_use_proxy_labels(dns_record_factory) ->
     assert format_cloud_status(False) == "DNS only"
     assert format_cloud_status(True) == "☁️ proxied"
     assert "Cloud: DNS only → ☁️ proxied" in changed_fields(original, updated)
+
+
+@pytest.mark.parametrize(
+    ("name", "expected"),
+    [
+        ("@", "example.com"),
+        ("www", "www.example.com"),
+        ("_sip._tcp", "_sip._tcp.example.com"),
+        ("www.example.com", "www.example.com"),
+        ("other.example.net.", "other.example.net"),
+    ],
+)
+def test_format_record_fqdn(name, expected) -> None:
+    assert format_record_fqdn(name, "example.com") == expected
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ([{"ip": "1.1.1.1", "port": 443, "weight": 100, "country": "IR"}], "1.1.1.1"),
+        ([{"ip": "1.1.1.1"}, {"ip": "1.0.0.1"}, {"ip": "8.8.8.8"}], "1.1.1.1 +2"),
+        ({"location": "origin.example.net"}, "origin.example.net"),
+        ({"host": "mx.example.net", "priority": 10}, "mx.example.net"),
+        (
+            {"target": "sip.example.net", "port": 5060, "weight": 5, "priority": 1},
+            "sip.example.net",
+        ),
+        ({"text": "v=spf1 -all"}, "v=spf1 -all"),
+        ({"domain": "host.example.net"}, "host.example.net"),
+        ({"tag": "issue", "value": "letsencrypt.org"}, "letsencrypt.org"),
+        ({"usage": "3", "selector": "1", "matching_type": "1", "certificate": "ab12"}, "ab12"),
+        ({"unexpected": "shape"}, "unexpected=shape"),
+    ],
+)
+def test_format_record_target_hides_secondary_fields(value, expected) -> None:
+    assert format_record_target(value) == expected

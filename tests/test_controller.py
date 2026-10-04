@@ -160,9 +160,44 @@ async def test_record_list_marks_proxied_and_protected_records(dns_record_factor
     await controller._show_records(1, state, page=1)
 
     labels = [row[0].text for row in bot.sent[-1][2].keyboard[:3]]
-    assert labels[0].startswith("☁️ A proxied")
-    assert labels[1].startswith("A dns-only")
-    assert labels[2].startswith("🔒 ☁️ A locked")
+    assert labels[0].startswith("☁️ A | proxied.")
+    assert labels[1].startswith("A | dns-only.")
+    assert labels[2].startswith("🔒 ☁️ A | locked.")
+
+
+async def test_record_buttons_show_fqdn_and_target_only(dns_record_factory) -> None:
+    bot = FakeBot()
+    gateway = FakeGateway()
+    controller = BotController(bot, settings(), gateway)  # type: ignore[arg-type]
+    state = controller.store.get(1)
+    state.selected_domain = "example.test"
+    gateway.list_records.return_value = page(
+        [
+            dns_record_factory(name="@", is_protected=True),
+            dns_record_factory(
+                type="mx",
+                name="mail",
+                cloud=False,
+                value={"host": "mx.example.net", "priority": 10},
+            ),
+            dns_record_factory(
+                type="cname",
+                name="a-very-long-subdomain-name",
+                cloud=False,
+                value={"host": "target.example.net"},
+            ),
+        ]
+    )
+
+    await controller._show_records(1, state, page=1)
+
+    labels = [row[0].text for row in bot.sent[-1][2].keyboard[:3]]
+    assert labels == [
+        "🔒 ☁️ A | example.test ➜ 192.0.2.10",
+        "MX | mail.example.test ➜ mx.example.net",
+        "CNAME | a-very-long-subdomain-nam… ➜ target.example.net",
+    ]
+    assert all(len(label) <= 64 for label in labels)
 
 
 async def test_cloud_status_is_consistent_in_details_choices_and_confirmations(
@@ -328,7 +363,7 @@ async def test_old_record_menu_uses_stable_id_and_reloads_current_data(
     gateway.list_records.return_value = page([old_record])
 
     await controller._show_records(1, state, page=1)
-    old_callback = button_data(bot.sent[-1][2], "☁️ A old — ip=192.0.2.10")
+    old_callback = button_data(bot.sent[-1][2], "☁️ A | old.example.test ➜ 192.0.2.10")
 
     gateway.list_records.return_value = page([new_record])
     await controller._show_records(1, state, page=1)

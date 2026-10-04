@@ -17,6 +17,9 @@ DEFAULT_IP_FILTER = IPFilterMode(count="single", order="none", geo_filter="none"
 
 _NAME_PATTERN = re.compile(r"^[A-Za-z0-9_.*@-]+(?:\.[A-Za-z0-9_*-]+)*\.?$")
 _INTEGER_LIMIT = 65_535
+# Fields holding the answer a record points to, in lookup order. Port, weight, priority,
+# and similar settings stay on the record detail screen.
+_TARGET_FIELDS = ("ip", "location", "host", "domain", "target", "text", "value", "certificate")
 
 
 class DNSInputError(ValueError):
@@ -260,7 +263,44 @@ def _key_value_text(value: Mapping[str, Any]) -> str:
     )
 
 
-def format_record_value(value: object, *, compact: bool = False) -> str:
+def format_record_fqdn(name: str, domain: str) -> str:
+    """Return the fully qualified name of a zone-relative record name."""
+
+    if name in {"", "@"}:
+        return domain
+    if name.endswith("."):
+        return name.rstrip(".")
+    if name == domain or name.endswith(f".{domain}"):
+        return name
+    return f"{name}.{domain}"
+
+
+def _target_text(value: object) -> str | None:
+    if isinstance(value, BaseModel):
+        value = value.model_dump()
+    if not isinstance(value, Mapping):
+        return None
+    for field in _TARGET_FIELDS:
+        item = value.get(field)
+        if item is not None and item != "":
+            return str(item)
+    return None
+
+
+def format_record_target(value: object) -> str:
+    """Return only the address or host a record points to, for compact list buttons."""
+
+    if isinstance(value, list):
+        targets = [target for item in value if (target := _target_text(item)) is not None]
+        if not targets:
+            return format_record_value(value)
+        extra = len(targets) - 1
+        return targets[0] if extra == 0 else f"{targets[0]} +{extra}"
+    target = _target_text(value)
+    return format_record_value(value) if target is None else target
+
+
+def format_record_value(value: object) -> str:
     """Format flexible ArvanCloud values without assuming one record shape."""
 
     if isinstance(value, list):
@@ -279,8 +319,6 @@ def format_record_value(value: object, *, compact: bool = False) -> str:
         text = _key_value_text(value)
     else:
         text = str(value)
-    if compact and len(text) > 32:
-        return f"{text[:29]}..."
     return text or "(empty)"
 
 
