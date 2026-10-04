@@ -55,7 +55,7 @@ SNAPSHOT_ACTIONS = {
     "domains": frozenset({"dp", "ds"}),
     "records": frozenset({"rp", "rs", "rr", "bd", "se", "sx", "fm", "cr"}),
     "record": frozenset({"en", "ev", "el", "et", "cl", "de", "br"}),
-    "filter": frozenset({"fv"}),
+    "filter": frozenset({"fv", "br"}),
     "confirmation": frozenset({"ok", "no"}),
 }
 RECORD_ACTIONS = frozenset({"en", "ev", "el", "et", "cl", "de"})
@@ -846,6 +846,7 @@ class BotController:
             for start in range(0, len(RECORD_TYPES), 3)
         ]
         rows.append([self._button("Any type", "fv", state, -1)])
+        rows.append([self._button("Back to records", "br", state)])
         self.store.remember_menu(chat_id, state, view="filter")
         await self._display(chat_id, "<b>Filter by record type</b>", self._markup(rows), message_id)
 
